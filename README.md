@@ -9,6 +9,31 @@ GUI nativa e multipiattaforma per `rsync`, scritta in Go + [Wails](https://wails
 
 Le build compilate (macOS Apple Silicon/Intel, Windows, Linux + AppImage) sono nella pagina **[Release](https://github.com/TrismegistoOpenSource/RsyncGUI/releases)** — non serve installare nulla per compilare, si scarica e si usa.
 
+### macOS: sbloccare l'app al primo avvio
+
+L'app **non è firmata con un Apple Developer ID**, quindi macOS la mette in
+quarantena e al primo avvio dice che è danneggiata o che non può essere aperta.
+Non è danneggiata: è la quarantena.
+
+Trascina prima l'app in **Applicazioni**, poi incolla nel Terminale la riga che
+corrisponde alla versione scaricata:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/RsyncGUI-AppleSilicon.app
+```
+
+```bash
+xattr -dr com.apple.quarantine /Applications/RsyncGUI-Intel.app
+```
+
+Va fatto una volta sola, e serve solo per le app scaricate da internet. In
+alternativa: clic destro sull'app → **Apri** → di nuovo **Apri**.
+
+> Questa sezione esiste unicamente perché manca una firma Apple riconosciuta
+> (che richiede un account Developer a pagamento). Il giorno in cui il progetto
+> ne avrà una e le build saranno notarizzate, la quarantena non scatterà più e
+> queste istruzioni andranno rimosse.
+
 ## Funzionalità
 
 - **Aggiungi / Rimuovi** profili di sincronizzazione, ciascuno con **più sorgenti e più destinazioni**: rsync accetta nativamente più sorgenti in un solo comando, ma una sola destinazione per invocazione, quindi l'app esegue un rsync per ogni destinazione, in sequenza.

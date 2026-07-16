@@ -41,10 +41,33 @@ jobs:
           /usr/libexec/PlistBuddy -c "Set :CFBundleName RsyncGUI-Intel" "dist/RsyncGUI-Intel.app/Contents/Info.plist"
           codesign --force --deep --sign - "dist/RsyncGUI-Intel.app"
       - name: Zip per la Release (un .app non è un asset scaricabile da solo)
+        # --keepParent è obbligatorio: senza, ditto archivia il CONTENUTO del
+        # bundle (Contents/ al primo livello) invece del bundle stesso. Lo zip
+        # si scompatta in una cartella con dentro Contents/ e il Finder non
+        # vede nessuna app. È il difetto degli asset di v2.1.0.
         run: |
           cd dist
-          ditto -c -k --sequesterRsrc RsyncGUI-AppleSilicon.app RsyncGUI-AppleSilicon-macOS.zip
-          ditto -c -k --sequesterRsrc RsyncGUI-Intel.app RsyncGUI-Intel-macOS.zip
+          ditto -c -k --sequesterRsrc --keepParent RsyncGUI-AppleSilicon.app RsyncGUI-AppleSilicon-macOS.zip
+          ditto -c -k --sequesterRsrc --keepParent RsyncGUI-Intel.app RsyncGUI-Intel-macOS.zip
+
+      - name: Verifica gli zip come li riceve l'utente
+        # Non basta che ditto esca con 0: si controlla lo zip scompattandolo,
+        # perché è quello che scarica l'utente. Un job verde non garantisce un
+        # artefatto giusto.
+        run: |
+          set -e
+          cd dist
+          for pair in "RsyncGUI-AppleSilicon:arm64" "RsyncGUI-Intel:x86_64"; do
+            name="${pair%%:*}"; want="${pair##*:}"
+            rm -rf check && mkdir check
+            unzip -q "$name-macOS.zip" -d check
+            test -d "check/$name.app" || { echo "FALLITO: $name-macOS.zip non contiene $name.app al primo livello"; ls -la check; exit 1; }
+            got=$(lipo -archs "check/$name.app/Contents/MacOS/RsyncGUI")
+            test "$got" = "$want" || { echo "FALLITO: $name.app è $got, atteso $want"; exit 1; }
+            codesign --verify --deep --strict "check/$name.app"
+            echo "OK: $name.app — architettura $got, firma valida"
+          done
+          rm -rf check
       - uses: actions/upload-artifact@v4
         with:
           name: RsyncGUI-macOS
