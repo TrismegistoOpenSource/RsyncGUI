@@ -1,0 +1,15 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "RsyncGUI",
+  "outputfilename": "RsyncGUI",
+  "frontend:install": "",
+  "frontend:build": "",
+  "frontend:dev:watcher": "",
+  "frontend:dev:serverUrl": "auto",
+  "info": {
+    "productName": "RsyncGUI",
+    "productVersion": "2.1.0",
+    "copyright": "© 2026",
+    "comments": "GUI leggera e multipiattaforma per rsync"
+  }
+}

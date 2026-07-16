@@ -1,0 +1,4 @@
+build/
+frontend/wailsjs/
+.DS_Store
+rsyncgui
