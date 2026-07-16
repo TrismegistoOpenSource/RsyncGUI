@@ -100,4 +100,6 @@ scripts/             script di build e generazione icona
 
 ## Licenza
 
-[GPL-3.0](LICENSE).
+[GPL-3.0](LICENSE). Le librerie Go incorporate nel binario e le loro licenze
+(tutte permissive) sono elencate in
+[THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md).
