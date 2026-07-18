@@ -518,3 +518,65 @@ input[type="text"]:focus {
 ::-webkit-scrollbar { width: 8px; }
 ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.12); border-radius: 4px; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.2); }
+
+/* ---- attività (job staccati) -------------------------------------------------
+   Le copie vivono anche a finestra chiusa, quindi l'app deve poter mostrare
+   cose che non ha avviato lei in questa sessione. */
+.jobs-badge {
+  min-width: 17px; height: 17px; padding: 0 5px;
+  border-radius: 9px; font-size: 10.5px; font-weight: 700;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--accent-grad); color: #08111f;
+}
+
+.running-note {
+  display: flex; align-items: center; gap: 10px;
+  margin-bottom: 12px; padding: 10px 14px;
+  font-size: 12.5px;
+  border-radius: 10px;
+  border: 1px solid rgba(79, 209, 255, 0.3);
+  background: rgba(79, 209, 255, 0.09);
+  color: var(--text);
+}
+.running-note .pulse {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent-a); flex-shrink: 0;
+  animation: pulse 1.6s ease-in-out infinite;
+}
+@keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.25 } }
+.running-note.orphan {
+  border-color: rgba(248, 113, 113, 0.35);
+  background: rgba(248, 113, 113, 0.08);
+}
+.running-note.orphan .pulse { background: var(--danger); animation: none; }
+
+.jobs-modal { max-width: 640px; }
+.jobs-hint { font-size: 12px; color: var(--text-dim); line-height: 1.5; margin-bottom: 10px; }
+.jobs-setting {
+  padding: 10px 12px; margin-bottom: 14px;
+  border: 1px solid var(--border); border-radius: 10px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.jobs-list { display: flex; flex-direction: column; gap: 8px; max-height: 46vh; overflow-y: auto; }
+.job-row {
+  display: flex; align-items: center; gap: 11px;
+  padding: 10px 12px;
+  border: 1px solid var(--border); border-radius: 10px;
+  background: rgba(255, 255, 255, 0.025);
+}
+.job-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; background: var(--text-dim); }
+.job-dot.running { background: var(--accent-a); animation: pulse 1.6s ease-in-out infinite; }
+.job-dot.success { background: var(--success); }
+.job-dot.partial { background: #fbbf24; }
+.job-dot.failed, .job-dot.orphaned { background: var(--danger); }
+.job-dot.aborted { background: var(--text-dim); }
+
+.job-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.job-name { font-size: 12.5px; font-weight: 600; }
+.job-meta {
+  font-size: 11px; color: var(--text-dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.job-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.jobs-empty { font-size: 12.5px; color: var(--text-dim); padding: 16px 4px; text-align: center; }

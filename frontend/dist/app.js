@@ -10,6 +10,7 @@ const state = {
   editingId: null,
   sortMode: localStorage.getItem("sortMode") || "tag", // "tag" | "manual"
   logOpen: false,
+  jobs: [],
 };
 
 const $ = (id) => document.getElementById(id);
@@ -733,6 +734,180 @@ function clearLog() {
   $("log-body").textContent = "";
 }
 
+
+// ---- attività: job staccati ---------------------------------------------------
+//
+// Da questa versione una copia non appartiene più alla finestra che l'ha
+// avviata: prosegue a finestra chiusa e va ritrovata alla riapertura. Tutto
+// qui dentro parte quindi dal disco, non da uno stato tenuto in memoria.
+
+const JOBS_POLL_MS = 1000;
+
+let jobsTimer = null;
+let followedJob = null;   // jobId di cui stiamo mostrando il log
+let followedOffset = 0;   // quanto ne abbiamo già letto
+
+function jobStatusLabel(j) {
+  if (j.alive) return "in corso";
+  switch (j.status) {
+    case "success":  return "completata";
+    case "partial":  return "completata con avvisi";
+    case "failed":   return "fallita";
+    case "aborted":  return "interrotta";
+    case "orphaned": return "interrotta in modo anomalo";
+    default:         return j.status;
+  }
+}
+
+function shortTime(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? "" : d.toLocaleString();
+}
+
+async function refreshJobs() {
+  let list;
+  try { list = await api().ListJobs(); } catch (_) { return; }
+  state.jobs = list || [];
+
+  const live = state.jobs.filter((j) => j.alive);
+  const badge = $("jobs-badge");
+  badge.hidden = live.length === 0;
+  badge.textContent = String(live.length);
+
+  renderRunningNote(live);
+  if (!$("jobs-modal").hidden) renderJobsList();
+  if (followedJob) pullFollowedLog();
+}
+
+// A job left running by a previous session is the whole point of the feature,
+// so the window says so instead of looking idle while a copy is under way.
+function renderRunningNote(live) {
+  const note = $("running-note");
+  const orphans = state.jobs.filter((j) => j.status === "orphaned");
+
+  if (live.length > 0) {
+    note.className = "running-note";
+    note.innerHTML = `<span class="pulse"></span><span>${
+      live.length === 1
+        ? `<strong>${escapeHtml(live[0].label)}</strong> è in corso${
+            live[0].currentDest ? " verso " + escapeHtml(live[0].currentDest) : ""}`
+        : `${live.length} copie sono in corso`
+    }</span>`;
+    note.hidden = false;
+    return;
+  }
+  if (orphans.length > 0) {
+    note.className = "running-note orphan";
+    note.innerHTML = `<span class="pulse"></span><span>${orphans.length === 1
+      ? "Una copia si è interrotta in modo anomalo: l'esito non è noto."
+      : `${orphans.length} copie si sono interrotte in modo anomalo.`}</span>`;
+    note.hidden = false;
+    return;
+  }
+  note.hidden = true;
+}
+
+function renderJobsList() {
+  const box = $("jobs-list");
+  box.innerHTML = "";
+  if (state.jobs.length === 0) {
+    box.innerHTML = `<div class="jobs-empty">Nessuna copia recente.</div>`;
+    return;
+  }
+
+  for (const j of state.jobs) {
+    const row = document.createElement("div");
+    row.className = "job-row";
+
+    const dot = document.createElement("span");
+    dot.className = "job-dot " + (j.alive ? "running" : j.status);
+
+    const main = document.createElement("div");
+    main.className = "job-main";
+    const where = j.alive && j.currentProfile ? ` — ${j.currentProfile}` : "";
+    main.innerHTML = `
+      <span class="job-name">${escapeHtml(j.label)}${escapeHtml(where)}</span>
+      <span class="job-meta">${escapeHtml(jobStatusLabel(j))} · ${escapeHtml(shortTime(j.startedAt))}${
+        j.summary ? " · " + escapeHtml(j.summary) : ""}</span>`;
+
+    const actions = document.createElement("div");
+    actions.className = "job-actions";
+
+    // "Segui" and not "Riprendi": this reattaches to a copy already under way.
+    // Restarting an interrupted one is what Avvia already does — rsync is
+    // incremental, so running it again resumes by its nature.
+    if (j.alive || j.hasLog) {
+      const follow = document.createElement("button");
+      follow.className = "btn ghost small";
+      follow.textContent = j.alive ? "Segui" : "Log";
+      follow.addEventListener("click", () => followJob(j.jobId));
+      actions.append(follow);
+    }
+    if (j.alive) {
+      const stop = document.createElement("button");
+      stop.className = "btn danger small";
+      stop.textContent = "Interrompi";
+      stop.addEventListener("click", async () => {
+        try { await api().StopJob(j.jobId); } catch (e) { showBanner(String(e), true); }
+      });
+      actions.append(stop);
+    }
+
+    row.append(dot, main, actions);
+    box.appendChild(row);
+  }
+}
+
+// followJob shows a job's log in the side panel, reading it from disk in
+// chunks. Chunks, not lines: a job that ran unattended can have written
+// megabytes, and feeding those to the webview one line at a time is exactly
+// what froze the window before 2.2.1.
+async function followJob(jobId) {
+  followedJob = jobId;
+  followedOffset = 0;
+  clearLog();
+  closeJobsModal();
+  openLog();
+  await pullFollowedLog();
+}
+
+async function pullFollowedLog() {
+  if (!followedJob) return;
+  try {
+    const chunk = await api().ReadJobLog(followedJob, followedOffset);
+    if (chunk.missing) {
+      if (followedOffset === 0) {
+        const j = state.jobs.find((x) => x.jobId === followedJob);
+        appendLog((j && j.summary ? j.summary + "\n" : "") +
+          "(il log di questa copia è stato cancellato: era andata a buon fine)\n");
+      }
+      followedJob = null;
+      return;
+    }
+    if (chunk.text) {
+      appendLog(chunk.text);
+      followedOffset = chunk.offset;
+    }
+    const j = state.jobs.find((x) => x.jobId === followedJob);
+    if (j && !j.alive && !chunk.text) followedJob = null; // finito e letto tutto
+  } catch (_) {
+    followedJob = null;
+  }
+}
+
+function openJobsModal() {
+  $("jobs-modal").hidden = false;
+  renderJobsList();
+}
+function closeJobsModal() { $("jobs-modal").hidden = true; }
+
+function startJobsPolling() {
+  if (jobsTimer !== null) return;
+  refreshJobs();
+  jobsTimer = setInterval(refreshJobs, JOBS_POLL_MS);
+}
+
 // ---- wiring -------------------------------------------------------------------
 
 function wire() {
@@ -771,6 +946,16 @@ function wire() {
   for (const list of ["src-list", "dest-list"]) {
     $(list).addEventListener("input", syncRecreateRow);
   }
+
+  $("btn-jobs").addEventListener("click", openJobsModal);
+  $("jobs-close").addEventListener("click", closeJobsModal);
+  $("jobs-modal").addEventListener("click", (e) => {
+    if (e.target === $("jobs-modal")) closeJobsModal();
+  });
+  $("f-detach").addEventListener("change", async (e) => {
+    try { await api().SetDetachJobs(e.target.checked); }
+    catch (err) { showBanner(String(err), true); }
+  });
 
   $("btn-cancel").addEventListener("click", closeEditor);
   $("btn-save").addEventListener("click", saveEditor);
@@ -837,6 +1022,8 @@ async function init() {
   const cp = $("config-path");
   cp.textContent = s.configPath;
   cp.title = s.configPath;
+  $("f-detach").checked = s.detachJobs !== false;
+  startJobsPolling();
   if (!s.rsyncPath) {
     showBanner("rsync non trovato nel PATH: installalo per poter avviare le sincronizzazioni.", true);
   }

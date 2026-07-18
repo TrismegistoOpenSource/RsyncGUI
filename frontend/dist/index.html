@@ -26,7 +26,7 @@
         </g>
       </svg>
       <span class="brand-name">RsyncGUI</span>
-      <span class="brand-version">2.2</span>
+      <span class="brand-version">2.3</span>
     </div>
     <div class="titlebar-actions" style="--wails-draggable:no-drag">
       <button class="btn ghost" id="btn-verify" title="Controlla una cartella: trova i file che il sistema elenca ma non riesce davvero ad aprire (letto soltanto, non copia né modifica nulla)">
@@ -40,6 +40,11 @@
       <button class="btn ghost" id="btn-export" title="Esporta configurazioni in un file JSON">
         <svg viewBox="0 0 24 24"><path d="M12 13V3m0 0L8 7m4-4l4 4M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
         Esporta
+      </button>
+      <button class="btn ghost" id="btn-jobs" title="Copie in corso e recenti">
+        <svg viewBox="0 0 24 24"><path d="M12 8v5l3 2"/><circle cx="12" cy="12" r="9"/></svg>
+        Attività
+        <span class="jobs-badge" id="jobs-badge" hidden></span>
       </button>
       <button class="btn ghost" id="btn-log" title="Mostra/nascondi log">
         <svg viewBox="0 0 24 24"><path d="M4 5h16M4 12h10M4 19h16"/></svg>
@@ -77,6 +82,7 @@
       </div>
 
       <div class="banner" id="banner" hidden></div>
+      <div class="running-note" id="running-note" hidden></div>
 
       <section class="profiles" id="profiles"></section>
 
@@ -170,6 +176,24 @@
       <div class="modal-actions">
         <button class="btn ghost" id="btn-cancel">Annulla</button>
         <button class="btn primary" id="btn-save">Salva</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="jobs-modal" hidden>
+    <div class="modal jobs-modal">
+      <h2>Attività</h2>
+      <p class="jobs-hint">
+        Le copie proseguono anche a finestra chiusa. Il log di quelle riuscite viene
+        cancellato subito: resta il riepilogo.
+      </p>
+      <label class="switch-row jobs-setting">
+        <span>Continua le copie anche se chiudo la finestra</span>
+        <input type="checkbox" id="f-detach" /><i></i>
+      </label>
+      <div class="jobs-list" id="jobs-list"></div>
+      <div class="modal-actions">
+        <button class="btn ghost" id="jobs-close">Chiudi</button>
       </div>
     </div>
   </div>

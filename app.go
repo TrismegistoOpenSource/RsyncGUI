@@ -132,6 +132,10 @@ type AppState struct {
 	ConfigPath string        `json:"configPath"`
 	RsyncPath  string        `json:"rsyncPath"`
 	Busy       bool          `json:"busy"`
+	// DetachJobs mirrors the setting: copies keep going when the window is
+	// closed. On by default — it is the point of 2.3 — but reversible for
+	// anyone who would rather a job die with the window that started it.
+	DetachJobs bool `json:"detachJobs"`
 }
 
 type App struct {
@@ -141,7 +145,8 @@ type App struct {
 	busy     bool
 	logOpen  bool
 	// abort cancels the running queue and kills the rsync process in flight.
-	abort context.CancelFunc
+	abort    context.CancelFunc
+	settings Settings
 
 	// Log lines are accumulated here and sent to the frontend in batches by
 	// logPump — see emitLog.
@@ -166,12 +171,18 @@ const (
 const logPanelWidth = 400
 
 func NewApp() *App {
-	return &App{profiles: []SyncProfile{}}
+	return &App{profiles: []SyncProfile{}, settings: defaultSettings()}
 }
 
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	a.load()
+	a.mu.Lock()
+	a.settings = loadSettings()
+	a.mu.Unlock()
+	// Old logs and finished jobs are cleared out on the way in: a handful of
+	// stats over a small directory, cheaper than any scheduling would be.
+	a.cleanupJobs()
 	go a.logPump(ctx)
 }
 
@@ -270,6 +281,7 @@ func (a *App) GetState() AppState {
 		ConfigPath: path,
 		RsyncPath:  rsync,
 		Busy:       a.busy,
+		DetachJobs: a.settings.DetachJobs,
 	}
 }
 
@@ -751,7 +763,19 @@ type statusEvent struct {
 // enqueue runs the given profiles strictly one after another, never
 // concurrently. Unavailable paths are skipped without stopping the queue;
 // every problem is repeated in a summary at the end of the log.
+// enqueue starts a run. With detach on (the default) the work is handed to a
+// supervisor process that outlives this window; the in-window runner below is
+// kept for when the setting is off, and is unchanged from 2.2.
 func (a *App) enqueue(list []SyncProfile) error {
+	if a.detachEnabled() {
+		label := runLabel(list)
+		_, err := a.startDetached(label, list)
+		return err
+	}
+	return a.enqueueInWindow(list)
+}
+
+func (a *App) enqueueInWindow(list []SyncProfile) error {
 	a.mu.Lock()
 	if a.busy {
 		a.mu.Unlock()

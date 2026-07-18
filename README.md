@@ -42,6 +42,8 @@ alternativa: clic destro sull'app → **Apri** → di nuovo **Apri**.
 - Opzioni rsync per profilo: checksum, elimina extra, simulazione, compressione, output dettagliato, scrittura diretta (`--inplace`) — sempre con `-a` per preservare permessi e timestamp.
 - **Ricrea struttura** (per profilo): copiando `/A` in `/B` si ottiene `/B/A/…` invece di riversare il contenuto di `A` direttamente in `/B`. È la regola dello slash finale di rsync resa esplicita. L'interruttore è rosso quando è attivo perché **spegnerlo dopo che il profilo ha già copiato è distruttivo se è attivo anche `--delete`**: la cartella `/B/A` scritta in precedenza diventa "di troppo" e rsync la elimina. L'app chiede conferma prima di lasciarlo spegnere, spiegando cosa succederebbe.
 - **Ripristina**: esegue la copia al contrario, dal backup verso la cartella originale. Disponibile solo sui profili con **una sorgente e una destinazione**, perché con più percorsi i file si mescolano nella destinazione e non è più possibile sapere da dove veniva ciascuno. Mostra sempre i percorsi esatti prima di procedere, tiene conto di "ricrea struttura" per sapere dove sta davvero il backup, e chiede ogni volta se applicare `--delete` — con una seconda conferma, perché in questa direzione cancellerebbe dall'originale tutto ciò che è stato creato dopo il backup.
+- **Le copie proseguono a finestra chiusa** (dalla 2.3): una copia avviata non appartiene più alla finestra che l'ha lanciata. Chiudere l'app — o un suo crash — non la interrompe; alla riapertura la sezione **Attività** mostra cosa è ancora in corso e permette di seguirlo o interromperlo. Resta comunque **una sola copia alla volta**, come prima. Disattivabile dall'interruttore in Attività.
+- **Pulizia automatica dei log**: il log di una copia riuscita viene cancellato appena finisce, lasciando solo il riepilogo; si conservano quelli delle copie fallite (30 giorni), con un tetto complessivo sulla cartella. Un backup non deve riempire il disco su cui salva.
 - **Notifiche di sistema** al termine di ogni profilo, con l'esito (completato, completato con avvisi, fallito). Un'interruzione volontaria non notifica nulla.
 - **Esclusioni automatiche** dei file che i sistemi operativi creano da soli (`.DS_Store`, `Thumbs.db`, `desktop.ini`, ecc.), attive di default, più esclusioni personalizzate.
 - **Percorsi non disponibili** (volume non montato, mount di rete morto) vengono saltati senza bloccare la coda, segnalati nel log e in un riepilogo a fine esecuzione.
@@ -49,6 +51,11 @@ alternativa: clic destro sull'app → **Apri** → di nuovo **Apri**.
 - **Interrompi** una sincronizzazione in corso con l'equivalente di Ctrl+C (SIGINT, non un kill secco: rsync ha modo di ripulire i file temporanei).
 - Log live in un pannello laterale che allarga la finestra invece di coprire l'interfaccia.
 - Import/export delle configurazioni in JSON, con backup automatico di una copia prima di ogni salvataggio.
+
+## Perché è fatta così
+
+Le decisioni di progetto, con le loro ragioni e le alternative scartate, sono in
+[docs/decisions.md](docs/decisions.md).
 
 ## Dove salva i dati
 
