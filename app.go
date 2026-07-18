@@ -142,7 +142,24 @@ type App struct {
 	logOpen  bool
 	// abort cancels the running queue and kills the rsync process in flight.
 	abort context.CancelFunc
+
+	// Log lines are accumulated here and sent to the frontend in batches by
+	// logPump — see emitLog.
+	logMu  sync.Mutex
+	logBuf strings.Builder
 }
+
+// How the log reaches the window. rsync -v on a large transfer emits thousands
+// of lines per second (measured: ~3200/s on a local disk); one event per line
+// saturates the webview's main thread and the whole GUI stops repainting.
+// Lines are therefore coalesced and flushed a few times per second, which is
+// far faster than anyone can read and costs one event instead of hundreds.
+const (
+	logFlushInterval = 100 * time.Millisecond
+	// Force a flush before the buffer grows past this, so a burst between two
+	// ticks can't hold an unbounded amount of text in memory.
+	maxPendingLogBytes = 256 * 1024
+)
 
 // logPanelWidth is how much the window grows to the right when the log panel
 // is shown, kept in sync with .log-panel width in style.css.
@@ -155,6 +172,7 @@ func NewApp() *App {
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	a.load()
+	go a.logPump(ctx)
 }
 
 // --- persistence -----------------------------------------------------------
@@ -752,6 +770,7 @@ func (a *App) enqueue(list []SyncProfile) error {
 			a.busy = false
 			a.abort = nil
 			a.mu.Unlock()
+			a.flushLog() // the closing summary must not wait for the next tick
 			a.emitEvent("run:busy", false)
 		}()
 
@@ -784,6 +803,7 @@ func (a *App) enqueue(list []SyncProfile) error {
 			default:
 				status = "failed"
 			}
+			a.flushLog() // keep the log ahead of the status dot it explains
 			a.emitEvent("run:status", statusEvent{ID: p.ID, Status: status, Message: detail})
 			a.notifyForStatus(status, p.Name, detail)
 		}
@@ -843,6 +863,7 @@ func (a *App) VerifyFolder(root string) error {
 			a.busy = false
 			a.abort = nil
 			a.mu.Unlock()
+			a.flushLog()
 			a.emitEvent("run:busy", false)
 		}()
 
@@ -905,8 +926,51 @@ func (a *App) verifyWalk(runCtx context.Context, root string) (scanned int, brok
 	return scanned, broken
 }
 
+// emitLog queues one piece of log output. It does not reach the window
+// immediately: logPump ships whatever has accumulated every logFlushInterval.
+// Callers can keep calling it per line without thinking about the cost.
 func (a *App) emitLog(text string) {
+	a.logMu.Lock()
+	a.logBuf.WriteString(text)
+	tooBig := a.logBuf.Len() >= maxPendingLogBytes
+	a.logMu.Unlock()
+
+	if tooBig {
+		a.flushLog()
+	}
+}
+
+// flushLog sends everything queued so far, if anything. Safe to call from any
+// goroutine and when there is no window: emitEvent drops the event, and the
+// buffer is emptied either way so it cannot grow without bound under test.
+func (a *App) flushLog() {
+	a.logMu.Lock()
+	if a.logBuf.Len() == 0 {
+		a.logMu.Unlock()
+		return
+	}
+	text := a.logBuf.String()
+	a.logBuf.Reset()
+	a.logMu.Unlock()
+
 	a.emitEvent("run:log", text)
+}
+
+// logPump flushes the queued log on a timer for as long as the app is running.
+// It costs one idle goroutine ticking a few times a second, which is nothing
+// next to what it saves during a transfer.
+func (a *App) logPump(ctx context.Context) {
+	ticker := time.NewTicker(logFlushInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			a.flushLog() // don't lose the last lines on the way out
+			return
+		case <-ticker.C:
+			a.flushLog()
+		}
+	}
 }
 
 // emitEvent is the single door to the frontend event bus. Wails aborts the

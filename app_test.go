@@ -859,3 +859,112 @@ func TestNotifyWithoutWindowIsSafe(t *testing.T) {
 	a.notifyForStatus("success", "Backup", "")
 	a.notify("messaggio")
 }
+
+// --- accorpamento del log -----------------------------------------------------
+
+// emitLog must not reach the frontend one line at a time: rsync -v emits
+// thousands of lines per second and an event each would freeze the window.
+// Lines accumulate until something flushes them.
+func TestEmitLogAccumulatesInsteadOfEmittingPerLine(t *testing.T) {
+	a := NewApp()
+	for i := 0; i < 1000; i++ {
+		a.emitLog("riga di output\n")
+	}
+
+	a.logMu.Lock()
+	buffered := a.logBuf.Len()
+	a.logMu.Unlock()
+
+	if buffered == 0 {
+		t.Fatal("le righe devono restare in buffer, non partire una per una")
+	}
+	if want := len("riga di output\n") * 1000; buffered != want {
+		t.Fatalf("buffer = %d byte, atteso %d: nessuna riga va persa", buffered, want)
+	}
+}
+
+// A burst between two ticks must not pile up without limit: past the threshold
+// emitLog flushes on the spot.
+func TestEmitLogFlushesWhenBufferGrowsTooLarge(t *testing.T) {
+	a := NewApp()
+	chunk := strings.Repeat("x", 8*1024)
+	for i := 0; i < (maxPendingLogBytes/len(chunk))+2; i++ {
+		a.emitLog(chunk)
+	}
+
+	a.logMu.Lock()
+	buffered := a.logBuf.Len()
+	a.logMu.Unlock()
+
+	if buffered >= maxPendingLogBytes {
+		t.Fatalf("buffer = %d byte, non deve superare %d senza svuotarsi", buffered, maxPendingLogBytes)
+	}
+}
+
+// flushLog empties the buffer and is harmless when there is nothing to send.
+func TestFlushLogEmptiesBuffer(t *testing.T) {
+	a := NewApp()
+	a.flushLog() // niente in coda: non deve esplodere
+
+	a.emitLog("qualcosa\n")
+	a.flushLog()
+
+	a.logMu.Lock()
+	defer a.logMu.Unlock()
+	if a.logBuf.Len() != 0 {
+		t.Fatalf("dopo il flush il buffer deve essere vuoto, ha %d byte", a.logBuf.Len())
+	}
+}
+
+// The pump must flush on its own while a copy is running, and stop when the
+// context is cancelled — leaving nothing behind.
+func TestLogPumpFlushesPeriodicallyAndStops(t *testing.T) {
+	a := NewApp()
+	ctx, cancel := context.WithCancel(context.Background())
+	go a.logPump(ctx)
+
+	a.emitLog("riga\n")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		a.logMu.Lock()
+		n := a.logBuf.Len()
+		a.logMu.Unlock()
+		if n == 0 {
+			cancel()
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	t.Fatal("il pump non ha svuotato il buffer entro 2 secondi")
+}
+
+// The runner must leave nothing queued when it finishes, or the closing
+// summary would sit in the buffer until the next tick — or forever, if the
+// app is closing.
+func TestRunnerFlushesLogBeforeFinishing(t *testing.T) {
+	t.Setenv("RSYNCGUI_CONFIG_DIR", t.TempDir())
+	a := NewApp()
+	a.profiles = []SyncProfile{{ID: "x", Name: "vuoto", Sources: []string{}, Destinations: []string{}}}
+
+	if err := a.RunOne("x"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		a.mu.Lock()
+		busy := a.busy
+		a.mu.Unlock()
+		if !busy {
+			a.logMu.Lock()
+			left := a.logBuf.Len()
+			a.logMu.Unlock()
+			if left != 0 {
+				t.Fatalf("a fine esecuzione restano %d byte non inviati", left)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("l'esecuzione non è terminata entro 3 secondi")
+}
