@@ -38,7 +38,7 @@ func main() {
 		Mac: &mac.Options{
 			TitleBar: mac.TitleBarHiddenInset(),
 			About: &mac.AboutInfo{
-				Title:   "RsyncGUI 2.3",
+				Title:   "RsyncGUI 2.4",
 				Message: "GUI leggera e multipiattaforma per rsync",
 			},
 		},

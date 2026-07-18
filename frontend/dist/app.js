@@ -210,6 +210,7 @@ function profileCard(p, draggable) {
   }
 
   const status = state.statuses[p.id] || "";
+  const job = state.jobOfProfile ? state.jobOfProfile[p.id] : null;
   const dot = document.createElement("span");
   dot.className = "status-dot " + status;
   dot.title = dotTitle(status, state.jobOfProfile ? state.jobOfProfile[p.id] : null);
@@ -241,6 +242,13 @@ function profileCard(p, draggable) {
     </div>
     <div class="card-path">&#x202A;${escapeHtml(p.sources[0] || "")}${extraSrc} <span class="arrow">→</span> ${escapeHtml(p.destinations[0] || "")}${extraDest}&#x202C;</div>
   `;
+
+  if (status === "running" && job) {
+    const prog = document.createElement("div");
+    prog.className = "card-progress";
+    prog.innerHTML = progressBar(job);
+    body.appendChild(prog);
+  }
 
   const actions = document.createElement("div");
   actions.className = "card-actions";
@@ -280,8 +288,6 @@ function profileCard(p, draggable) {
   }
 
   actions.append(btnRun);
-
-  const job = state.jobOfProfile ? state.jobOfProfile[p.id] : null;
 
   // The log of the last run, straight from the card: it is where anyone looks
   // first after a copy finishes, and having to go through Attività for it was
@@ -799,6 +805,7 @@ function deriveProfileStatuses() {
     render();
   } else {
     renderProfileDots();
+    renderProfileProgress();
   }
 }
 
@@ -812,6 +819,17 @@ function renderProfileDots() {
     const st = state.statuses[id] || "";
     dot.className = "status-dot " + st;
     dot.title = dotTitle(st, state.jobOfProfile ? state.jobOfProfile[id] : null);
+  }
+}
+
+// renderProfileProgress refreshes just the bars, so the poll does not rebuild
+// the whole list once a second.
+function renderProfileProgress() {
+  for (const card of $("profiles").querySelectorAll(".card")) {
+    const holder = card.querySelector(".card-progress");
+    if (!holder) continue;
+    const job = state.jobOfProfile ? state.jobOfProfile[card.dataset.id] : null;
+    if (job) holder.innerHTML = progressBar(job);
   }
 }
 
@@ -830,6 +848,20 @@ function dotTitle(status, job) {
     case "aborted": return "Interrotta" + extra;
     default:        return "";
   }
+}
+
+
+// progressBar renders the bar. A percentage below zero means rsync has not
+// said anything usable yet — an incremental run with nothing to copy never
+// reports at all — so the bar shuttles instead of claiming to be at zero.
+function progressBar(job) {
+  const known = job.percent >= 0;
+  const files = job.filesTotal > 0 ? `${job.filesDone}/${job.filesTotal} file` : "";
+  const label = known ? `${job.percent}%` : "in corso";
+  return `<span class="progress${known ? "" : " indeterminate"}">
+      <span class="progress-fill" style="${known ? `width:${job.percent}%` : ""}"></span>
+    </span>
+    <span class="progress-label">${label}${files ? " · " + escapeHtml(files) : ""}</span>`;
 }
 
 function jobStatusLabel(j) {
@@ -874,12 +906,11 @@ function renderRunningNote(live) {
 
   if (live.length > 0) {
     note.className = "running-note";
-    note.innerHTML = `<span class="pulse"></span><span>${
-      live.length === 1
-        ? `<strong>${escapeHtml(live[0].label)}</strong> è in corso${
-            live[0].currentDest ? " verso " + escapeHtml(live[0].currentDest) : ""}`
-        : `${live.length} copie sono in corso`
-    }</span>`;
+    note.innerHTML = live.length === 1
+      ? `<span class="pulse"></span><span><strong>${escapeHtml(live[0].label)}</strong>${
+          live[0].currentProfile ? " — " + escapeHtml(live[0].currentProfile) : ""}</span>` +
+        progressBar(live[0])
+      : `<span class="pulse"></span><span>${live.length} copie sono in corso</span>`;
     note.hidden = false;
     return;
   }
@@ -916,6 +947,13 @@ function renderJobsList() {
       <span class="job-name">${escapeHtml(j.label)}${escapeHtml(where)}</span>
       <span class="job-meta">${escapeHtml(jobStatusLabel(j))} · ${escapeHtml(shortTime(j.startedAt))}${
         j.summary ? " · " + escapeHtml(j.summary) : ""}</span>`;
+
+    if (j.alive) {
+      const prog = document.createElement("div");
+      prog.className = "job-progress";
+      prog.innerHTML = progressBar(j);
+      main.appendChild(prog);
+    }
 
     const actions = document.createElement("div");
     actions.className = "job-actions";

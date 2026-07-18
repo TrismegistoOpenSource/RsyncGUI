@@ -53,6 +53,9 @@ type JobView struct {
 	ProfileIDs     []string `json:"profileIds"`
 	CurrentProfile string   `json:"currentProfile"`
 	CurrentDest    string   `json:"currentDest"`
+	Percent        int      `json:"percent"`
+	FilesDone      int      `json:"filesDone"`
+	FilesTotal     int      `json:"filesTotal"`
 	HasLog         bool     `json:"hasLog"`
 	LogTruncated   bool     `json:"logTruncated"`
 }
@@ -91,6 +94,7 @@ func (a *App) ListJobs() ([]JobView, error) {
 			Alive:   st.Running() && store.IsAlive(st.JobID),
 			Summary: st.Summary, Issues: st.Issues,
 			CurrentProfile: st.CurrentProfile, CurrentDest: st.CurrentDest,
+			Percent: st.Percent, FilesDone: st.FilesDone, FilesTotal: st.FilesTotal,
 			HasLog: hasLog, LogTruncated: st.LogTruncated,
 			StartedAt: st.StartedAt.Format(time.RFC3339),
 		}
@@ -132,6 +136,7 @@ func (a *App) startDetached(label string, list []SyncProfile) (string, error) {
 		Label:     label,
 		Status:    jobs.StatusRunning,
 		StartedAt: time.Now(),
+		Percent:   -1,
 	}
 	for _, p := range list {
 		raw, err := json.Marshal(p.Options)

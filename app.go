@@ -1115,6 +1115,15 @@ func rsyncArgs(opts SyncOptions, sources []string, dest string) []string {
 	if opts.Inplace {
 		args = append(args, "--inplace")
 	}
+	// --progress is what makes a progress bar possible at all: rsync is the
+	// only one that knows how many files it will really touch, since it
+	// decides for itself what to skip as already up to date. Its output is
+	// parsed and kept out of the log (see progress.go), so this costs nothing
+	// but the numbers.
+	//
+	// --info=progress2 would be tidier but does not exist everywhere: macOS
+	// ships openrsync, which rejects it. --progress works on both families.
+	args = append(args, "--progress")
 	if opts.ExcludeSystemFiles {
 		for _, pattern := range systemFileExcludes {
 			args = append(args, "--exclude="+pattern)

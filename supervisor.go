@@ -100,6 +100,9 @@ func supervise(dir, jobID string) error {
 	st.Issues = res.issues
 	st.Summary = res.summary
 	st.CurrentProfile, st.CurrentDest = "", ""
+	if res.status == jobs.StatusSuccess {
+		st.Percent = 100
+	}
 	if err := jobs.WriteState(dir, st); err != nil {
 		return err
 	}
@@ -131,11 +134,34 @@ func runProfiles(dir string, st *jobs.State, logw *jobs.LogWriter, stopped <-cha
 	)
 	start := time.Now()
 
+	// Progress reaches the window through the state file, which is rewritten
+	// at most a few times a second: rsync reports on every file, and writing
+	// the state that often would hammer the disk to say almost nothing new.
+	var (
+		lastWrite time.Time
+		lastPct   = -2
+	)
+	onProgress := func(ps ProgressState) {
+		if ps.Percent == lastPct && time.Since(lastWrite) < time.Second {
+			return
+		}
+		if ps.Percent == lastPct && ps.Percent >= 0 {
+			return // stessa percentuale: niente di nuovo da dire
+		}
+		lastPct, lastWrite = ps.Percent, time.Now()
+		st.Percent, st.FilesDone, st.FilesTotal = ps.Percent, ps.FilesDone, ps.FilesTotal
+		_ = jobs.WriteState(dir, *st)
+	}
+
 	for _, prof := range st.Profiles {
 		if aborted {
 			break
 		}
 		st.CurrentProfile = prof.Name
+		// Each profile is a fresh transfer: carrying the previous one's
+		// percentage over would show a bar that starts at 100%.
+		st.Percent, st.FilesDone, st.FilesTotal = -1, 0, 0
+		lastPct = -2
 		_ = jobs.WriteState(dir, *st)
 		fmt.Fprintf(logw, "\n═══ %s ═══\n", prof.Name)
 
@@ -183,7 +209,7 @@ func runProfiles(dir string, st *jobs.State, logw *jobs.LogWriter, stopped <-cha
 				fmt.Fprintf(logw, "→ verso %s\n", dest)
 			}
 
-			exit, err := runOneRsync(opts, srcs, dest, logw, stopped, &aborted)
+			exit, err := runOneRsync(opts, srcs, dest, logw, stopped, &aborted, onProgress)
 			lastExit = exit
 			switch {
 			case aborted:
@@ -230,15 +256,21 @@ func runProfiles(dir string, st *jobs.State, logw *jobs.LogWriter, stopped <-cha
 // The pipe between rsync and this process is harmless: this process is the one
 // that outlives the window, so nothing closes the read end early. The pipe
 // that used to kill transfers was the one between rsync and the GUI.
-func runOneRsync(opts SyncOptions, srcs []string, dest string, logw *jobs.LogWriter, stopped <-chan os.Signal, aborted *bool) (int, error) {
+func runOneRsync(opts SyncOptions, srcs []string, dest string, logw *jobs.LogWriter, stopped <-chan os.Signal, aborted *bool, onProgress func(ProgressState)) (int, error) {
 	bin, err := exec.LookPath("rsync")
 	if err != nil {
 		return -1, errors.New("rsync non trovato nel PATH")
 	}
 
+	// The progress writer sits in front of the log: it reads rsync's --progress
+	// output for the percentage and keeps those lines out of the log, which
+	// would otherwise double in size for status that is obsolete a second later.
+	pw := newProgressWriter(logw, onProgress)
+	defer pw.Flush()
+
 	cmd := exec.Command(bin, rsyncArgs(opts, srcs, dest)...)
-	cmd.Stdout = logw
-	cmd.Stderr = logw
+	cmd.Stdout = pw
+	cmd.Stderr = pw
 	if err := cmd.Start(); err != nil {
 		return -1, err
 	}

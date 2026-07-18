@@ -583,3 +583,47 @@ input[type="text"]:focus {
 }
 .job-actions { display: flex; gap: 6px; flex-shrink: 0; }
 .jobs-empty { font-size: 12.5px; color: var(--text-dim); padding: 16px 4px; text-align: center; }
+
+/* ---- barra di avanzamento ----------------------------------------------------
+   La percentuale arriva da rsync, che è l'unico a sapere quanti file toccherà
+   davvero: qualsiasi conteggio fatto da noi in anticipo sarebbe smentito dal
+   primo file saltato perché già aggiornato. Quando rsync non dice nulla (una
+   copia incrementale senza modifiche non emette progresso) la barra resta
+   indeterminata invece di inventare uno zero. */
+.progress {
+  position: relative;
+  height: 4px; border-radius: 3px;
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.progress-fill {
+  position: absolute; inset: 0 auto 0 0;
+  background: var(--accent-grad);
+  border-radius: 3px;
+  transition: width 0.4s ease;
+}
+/* Senza percentuale: una spola, che dice "sto lavorando" senza mentire su quanto manchi. */
+.progress.indeterminate .progress-fill {
+  width: 35%; animation: slide 1.4s ease-in-out infinite;
+}
+@keyframes slide {
+  0% { left: -35% } 100% { left: 100% }
+}
+
+.progress-label {
+  font-family: var(--mono); font-size: 11px;
+  color: var(--text-dim); white-space: nowrap;
+}
+
+/* nella nota in cima */
+.running-note .progress { flex: 1; min-width: 80px; margin: 0 4px; }
+.running-note .progress-label { color: var(--text); font-weight: 600; }
+
+/* nella riga di Attività */
+.job-progress { display: flex; align-items: center; gap: 8px; margin-top: 5px; }
+.job-progress .progress { flex: 1; }
+
+/* sulla card del profilo */
+.card-progress { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+.card-progress .progress { flex: 1; max-width: 260px; }

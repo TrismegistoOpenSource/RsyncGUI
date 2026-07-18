@@ -139,6 +139,40 @@ recente che nomina un profilo è quello che ne descrive lo stato.
 
 ---
 
+## 5-ter. La percentuale la calcola rsync, non noi (2.4)
+
+**Deciso**: l'avanzamento si ricava analizzando l'output di `--progress`, non
+contando i file prima di partire.
+
+**Perché**: è rsync a decidere cosa trasferirà davvero, saltando ciò che è già
+aggiornato. Qualsiasi conteggio fatto da noi in anticipo verrebbe smentito dal primo
+file saltato, e su un backup incrementale — il caso normale — sarebbe sbagliato di
+ordini di grandezza.
+
+**Scartato `--info=progress2`**, che sarebbe più ordinato: **non esiste ovunque**. macOS
+(da Sequoia) monta **openrsync**, che si dichiara "rsync version 2.6.9 compatible" e
+rifiuta l'opzione. `--progress` funziona su entrambe le famiglie.
+
+**Trappola verificata sul campo**: le due famiglie contano in direzioni opposte.
+GNU rsync scrive `to-chk=N/M` dove N sono i file **rimanenti** e scende verso zero;
+openrsync scrive `to-check=N/M` dove N sono quelli **fatti** e sale verso il totale.
+Nessuno dei due dichiara quale sia, quindi la direzione si deduce guardando muovere le
+prime due letture: finché non è nota la percentuale resta sconosciuta, che è meglio di
+mostrarne una invertita. (Un primo tentativo con l'espressione regolare
+`to-chk(?:eck)?` sembrava coprire entrambe le grafie ma accetta "to-chk" e "to-chkeck",
+non "to-check": lo hanno scoperto i test scritti sui formati veri catturati dai due
+programmi.)
+
+**Le righe di progresso non finiscono nel log**: sono stato transitorio, non eventi, e
+GNU rsync le riscrive in continuazione con un ritorno a capo mentre un file grande
+attraversa. Conservarne ogni revisione seppellirebbe il log sotto il proprio contatore.
+
+**La percentuale può mancare**: una copia incrementale senza modifiche non emette
+progresso affatto (verificato). In quel caso la barra resta indeterminata invece di
+inventare uno zero.
+
+---
+
 ## 6. "Segui", non "Riprendi"
 
 **Deciso**: il pulsante su un job vivo si chiama **Segui** e si limita a riagganciare

@@ -57,7 +57,13 @@ type State struct {
 	// window can show progress without parsing the log.
 	CurrentProfile string `json:"currentProfile,omitempty"`
 	CurrentDest    string `json:"currentDest,omitempty"`
-	LogTruncated   bool   `json:"logTruncated"`
+	// Percent is -1 when rsync has not said anything usable yet, which is
+	// honest: an incremental run with nothing to copy emits no progress at
+	// all, and a fabricated 0% would be a worse answer than "not known".
+	Percent      int  `json:"percent"`
+	FilesDone    int  `json:"filesDone"`
+	FilesTotal   int  `json:"filesTotal"`
+	LogTruncated bool `json:"logTruncated"`
 	// Summary outlives the log: a job that went fine has its log deleted, and
 	// this one line is all that remains of it.
 	Summary string   `json:"summary,omitempty"`
