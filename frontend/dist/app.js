@@ -11,6 +11,7 @@ const state = {
   sortMode: localStorage.getItem("sortMode") || "tag", // "tag" | "manual"
   logOpen: false,
   jobs: [],
+  jobOfProfile: {},
 };
 
 const $ = (id) => document.getElementById(id);
@@ -208,12 +209,10 @@ function profileCard(p, draggable) {
     card.appendChild(handle);
   }
 
+  const status = state.statuses[p.id] || "";
   const dot = document.createElement("span");
-  dot.className = "status-dot " + (state.statuses[p.id] || "");
-  const status = state.statuses[p.id];
-  if (status === "partial") dot.title = "Completata con avvisi: vedi il log";
-  if (status === "failed") dot.title = "Fallita: vedi il log";
-  if (status === "aborted") dot.title = "Interrotta";
+  dot.className = "status-dot " + status;
+  dot.title = dotTitle(status, state.jobOfProfile ? state.jobOfProfile[p.id] : null);
 
   const body = document.createElement("div");
   body.className = "card-body";
@@ -282,6 +281,20 @@ function profileCard(p, draggable) {
 
   actions.append(btnRun);
 
+  const job = state.jobOfProfile ? state.jobOfProfile[p.id] : null;
+
+  // The log of the last run, straight from the card: it is where anyone looks
+  // first after a copy finishes, and having to go through Attività for it was
+  // a step too many.
+  if (job && !job.alive && job.hasLog) {
+    const btnLog = document.createElement("button");
+    btnLog.className = "btn ghost small";
+    btnLog.textContent = "Log";
+    btnLog.title = "Mostra il log dell'ultima copia";
+    btnLog.addEventListener("click", (e) => { e.stopPropagation(); followJob(job.jobId); });
+    actions.append(btnLog);
+  }
+
   // Only the profile actually running can be stopped, so the button lives on
   // that row, next to its (disabled) Avvia.
   if (status === "running") {
@@ -291,7 +304,12 @@ function profileCard(p, draggable) {
     btnAbort.title = "Ferma la copia come Ctrl+C e annulla quelle ancora in coda";
     btnAbort.addEventListener("click", async (e) => {
       e.stopPropagation();
-      try { await api().Abort(); } catch (err) { showBanner(String(err), true); }
+      try {
+        // A detached job is stopped by signalling its supervisor; Abort only
+        // reaches a run happening inside this window.
+        if (job && job.alive) await api().StopJob(job.jobId);
+        else await api().Abort();
+      } catch (err) { showBanner(String(err), true); }
     });
     actions.append(btnAbort);
   }
@@ -752,6 +770,68 @@ let followedJob = null;    // jobId di cui stiamo mostrando il log
 let followedOffset = 0;    // quanto ne abbiamo già letto
 let followedSkipping = false; // già avvisato che stiamo saltando
 
+// deriveProfileStatuses rebuilds the per-profile state shown on the cards.
+//
+// Until 2.2 this came from run:status events emitted while the runner worked
+// inside this window. With detached jobs there is nothing to emit — the copy
+// may well have been started by a window that no longer exists — so the state
+// is read back from the jobs on disk. The most recent job that mentions a
+// profile is the one that describes it, which is also why a status now
+// survives closing and reopening the app.
+function deriveProfileStatuses() {
+  const statuses = {};
+  const jobOf = {};
+  // state.jobs is newest first, so the first mention of a profile wins.
+  for (const j of state.jobs) {
+    for (const pid of j.profileIds || []) {
+      if (statuses[pid] !== undefined) continue;
+      statuses[pid] = j.alive ? "running" : j.status;
+      jobOf[pid] = j;
+    }
+  }
+  state.statuses = statuses;
+  state.jobOfProfile = jobOf;
+  // Avvia must be disabled while anything is running, as it always was: with
+  // one job at a time, a live job means the app is busy.
+  const busy = state.jobs.some((j) => j.alive);
+  if (busy !== state.busy) {
+    state.busy = busy;
+    render();
+  } else {
+    renderProfileDots();
+  }
+}
+
+// renderProfileDots repaints just the dots, so the poll does not rebuild the
+// whole list once a second and lose scroll position or selection.
+function renderProfileDots() {
+  for (const card of $("profiles").querySelectorAll(".card")) {
+    const id = card.dataset.id;
+    const dot = card.querySelector(".status-dot");
+    if (!dot) continue;
+    const st = state.statuses[id] || "";
+    dot.className = "status-dot " + st;
+    dot.title = dotTitle(st, state.jobOfProfile ? state.jobOfProfile[id] : null);
+  }
+}
+
+function dotTitle(status, job) {
+  const summary = job && job.summary ? job.summary : "";
+  // The summary already tells the whole story for an interrupted job; adding a
+  // label in front of it would just say the same thing twice.
+  if (status === "orphaned") return summary || "Interrotta in modo anomalo: esito non noto";
+
+  const extra = summary ? " — " + summary : "";
+  switch (status) {
+    case "running": return "Copia in corso" + extra;
+    case "success": return "Ultima copia completata" + extra;
+    case "partial": return "Completata con avvisi: vedi il log" + extra;
+    case "failed":  return "Fallita: vedi il log" + extra;
+    case "aborted": return "Interrotta" + extra;
+    default:        return "";
+  }
+}
+
 function jobStatusLabel(j) {
   if (j.alive) return "in corso";
   switch (j.status) {
@@ -774,6 +854,7 @@ async function refreshJobs() {
   let list;
   try { list = await api().ListJobs(); } catch (_) { return; }
   state.jobs = list || [];
+  deriveProfileStatuses();
 
   const live = state.jobs.filter((j) => j.alive);
   const badge = $("jobs-badge");

@@ -24,10 +24,17 @@ import (
 // never write to the same destination, which is the real hazard there.
 const RunningLockName = "running.lock"
 
-// Retention. A job that went fine has nothing to tell: its log is deleted the
-// moment it finishes and the one-line summary in its state takes over. Logs
-// are only worth keeping when something went wrong.
+// Retention. The point is that the folder cannot grow without bound — not that
+// evidence gets destroyed. A job that went fine keeps a short tail of its log,
+// enough to look at what happened, while the bulk of it (thousands of
+// identical "file transferred" lines) goes away. Something that failed keeps
+// its log whole, because that is where the answer is.
 const (
+	// SuccessLogTail is what survives of a successful run's log. Fifty jobs of
+	// history at this size is a few megabytes: nothing, next to the hundreds a
+	// single verbose run can produce.
+	SuccessLogTail = 64 << 10
+
 	FailedLogRetention = 30 * 24 * time.Hour // logs of failed runs
 	StateRetention     = 90 * 24 * time.Hour // the small state files
 	MaxJobsKept        = 50                  // history depth
@@ -98,10 +105,13 @@ func (s *Store) List() ([]State, error) {
 	return out, nil
 }
 
-// FinishLog applies the end-of-job half of the retention policy: the log of a
-// run that went fine (or was deliberately stopped) is deleted straight away.
-// Keeping megabytes of "file transferred" lines for a copy nobody will ask
-// about again is exactly how the folder fills up.
+// FinishLog applies the end-of-job half of the retention policy.
+//
+// A run that went fine (or was deliberately stopped) keeps only the tail of
+// its log: the megabytes of "file transferred" lines are what fills the folder
+// up, but throwing the whole thing away leaves no way to look at a copy that
+// has just finished — which is the first thing anyone wants to do. A run that
+// failed keeps everything: that log is the reason it exists.
 func (s *Store) FinishLog(st State) error {
 	p, err := s.Paths(st.JobID)
 	if err != nil {
@@ -109,11 +119,48 @@ func (s *Store) FinishLog(st State) error {
 	}
 	switch st.Status {
 	case StatusSuccess, StatusAborted:
-		if err := os.Remove(p.Log); err != nil && !os.IsNotExist(err) {
-			return err
-		}
+		return shrinkToTail(p.Log, SuccessLogTail)
 	}
 	return nil
+}
+
+// shrinkToTail rewrites a file keeping only its last n bytes, starting at a
+// line boundary. A missing file is not an error: the job may never have
+// written anything.
+func shrinkToTail(path string, n int) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if len(data) <= n {
+		return nil
+	}
+
+	tail := data[len(data)-n:]
+	if i := indexOfNewline(tail); i >= 0 && i+1 < len(tail) {
+		tail = tail[i+1:]
+	}
+	var out []byte
+	out = append(out, []byte("⋯ copia riuscita: conservata solo la parte finale del log ⋯\n\n")...)
+	out = append(out, tail...)
+
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func indexOfNewline(b []byte) int {
+	for i := range b {
+		if b[i] == '\n' {
+			return i
+		}
+	}
+	return -1
 }
 
 // Cleanup enforces the periodic half of the policy. It runs at startup and

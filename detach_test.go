@@ -148,10 +148,15 @@ func TestJobSurvivesWindowBeingKilled(t *testing.T) {
 		t.Fatalf("file copiati = %d, attesi %d", copied, 12*300)
 	}
 
-	// E il log di un job riuscito dev'essere sparito (politica di ritenzione).
+	// Il log di un job riuscito resta consultabile ma ridotto alla coda: la
+	// ritenzione serve a non riempire il disco, non a cancellare le prove.
 	p, _ := store.Paths(id)
-	if _, err := os.Stat(p.Log); err == nil {
-		t.Error("il log di un job riuscito doveva essere cancellato")
+	fi, err := os.Stat(p.Log)
+	if err != nil {
+		t.Fatalf("il log di un job riuscito deve restare leggibile: %v", err)
+	}
+	if fi.Size() > jobs.SuccessLogTail+2048 {
+		t.Errorf("log = %d byte, doveva essere ridotto a ~%d", fi.Size(), jobs.SuccessLogTail)
 	}
 
 	// Il lock globale dev'essere stato rilasciato, o niente ripartirebbe più.

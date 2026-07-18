@@ -210,6 +210,9 @@ body {
 .status-dot.failed { background: var(--danger); box-shadow: 0 0 8px rgba(248, 113, 113, 0.5); }
 .status-dot.partial { background: #fbbf24; box-shadow: 0 0 8px rgba(251, 191, 36, 0.5); }
 .status-dot.aborted { background: var(--text-dim); box-shadow: 0 0 6px rgba(139, 147, 167, 0.4); }
+/* Interrotto in modo anomalo: l'esito non è noto. Si distingue da "fallita"
+   perché non sappiamo se i dati siano arrivati o no. */
+.status-dot.orphaned { background: var(--danger); box-shadow: 0 0 6px rgba(248, 113, 113, 0.45); opacity: 0.75; }
 
 .card-count {
   font-size: 10.5px; font-weight: 600; color: var(--text-dim);

@@ -222,27 +222,19 @@ func logExists(t *testing.T, s *Store, id string) bool {
 	return err == nil
 }
 
-// A copy that went fine has nothing to tell: its megabytes of "file
-// transferred" lines are exactly what fills the folder up.
-func TestFinishLogDeletesLogOfSuccessfulRun(t *testing.T) {
+// Whatever the outcome, the log must still be there to look at afterwards.
+// 2.3.0 deleted it on success, which made a finished copy impossible to
+// inspect — the retention policy is about size, not about erasing evidence.
+func TestFinishLogNeverRemovesTheLogEntirely(t *testing.T) {
 	s := tempStore(t)
-	for _, tc := range []struct {
-		status string
-		keep   bool
-	}{
-		{StatusSuccess, false},
-		{StatusAborted, false},
-		{StatusFailed, true},
-		{StatusPartial, true},
-		{StatusOrphaned, true},
-	} {
-		id := writeFinished(t, s, tc.status, time.Now(), 1024)
+	for _, status := range []string{StatusSuccess, StatusAborted, StatusFailed, StatusPartial, StatusOrphaned} {
+		id := writeFinished(t, s, status, time.Now(), 1024)
 		st, _ := ReadState(s.Dir, id)
 		if err := s.FinishLog(st); err != nil {
 			t.Fatal(err)
 		}
-		if got := logExists(t, s, id); got != tc.keep {
-			t.Errorf("stato %s: log presente = %v, atteso %v", tc.status, got, tc.keep)
+		if !logExists(t, s, id) {
+			t.Errorf("stato %s: il log deve restare consultabile", status)
 		}
 	}
 }
@@ -395,5 +387,88 @@ func TestOptionsRoundTripAsOpaqueJSON(t *testing.T) {
 	}
 	if !back.Checksum {
 		t.Fatal("le opzioni devono sopravvivere al giro su disco")
+	}
+}
+
+// The log of a successful run must remain readable: the first thing anyone
+// does after a copy finishes is look at what it did. Deleting it outright —
+// which is what 2.3.0 did — left nothing to look at.
+func TestFinishLogKeepsATailOfASuccessfulRun(t *testing.T) {
+	s := tempStore(t)
+	id := writeFinished(t, s, StatusSuccess, time.Now(), 0)
+	p, _ := s.Paths(id)
+
+	var b strings.Builder
+	for i := 0; b.Len() < 4<<20; i++ {
+		b.WriteString("file trasferito numero ")
+		b.WriteString(strings.Repeat("z", 60))
+		b.WriteString("\n")
+	}
+	b.WriteString("ULTIMA RIGA\n")
+	if err := os.WriteFile(p.Log, []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	st, _ := ReadState(s.Dir, id)
+	if err := s.FinishLog(st); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(p.Log)
+	if err != nil {
+		t.Fatalf("il log di una copia riuscita deve restare leggibile: %v", err)
+	}
+	if len(data) > SuccessLogTail+512 {
+		t.Fatalf("log = %d byte, doveva essere ridotto a ~%d", len(data), SuccessLogTail)
+	}
+	if !strings.Contains(string(data), "ULTIMA RIGA") {
+		t.Fatal("la coda del log deve contenere le ultime righe, che sono quelle che contano")
+	}
+	if !strings.Contains(string(data), "conservata solo la parte finale") {
+		t.Fatal("la riduzione va dichiarata, non fatta di nascosto")
+	}
+}
+
+// A failed run keeps its log whole: that is the reason it exists.
+func TestFinishLogKeepsAFailedRunIntact(t *testing.T) {
+	s := tempStore(t)
+	id := writeFinished(t, s, StatusFailed, time.Now(), 0)
+	p, _ := s.Paths(id)
+	big := make([]byte, 2<<20)
+	for i := range big {
+		big[i] = 'x'
+	}
+	if err := os.WriteFile(p.Log, big, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	st, _ := ReadState(s.Dir, id)
+	if err := s.FinishLog(st); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(p.Log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Size() != int64(len(big)) {
+		t.Fatalf("il log di una copia fallita non va toccato: %d byte invece di %d", fi.Size(), len(big))
+	}
+}
+
+// A log shorter than the tail is left exactly as it is: nothing to shrink.
+func TestFinishLogLeavesShortLogsAlone(t *testing.T) {
+	s := tempStore(t)
+	id := writeFinished(t, s, StatusSuccess, time.Now(), 0)
+	p, _ := s.Paths(id)
+	if err := os.WriteFile(p.Log, []byte("copia breve\nfinita\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := ReadState(s.Dir, id)
+	if err := s.FinishLog(st); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(p.Log)
+	if string(data) != "copia breve\nfinita\n" {
+		t.Fatalf("un log corto non va toccato: %q", data)
 	}
 }

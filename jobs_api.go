@@ -38,14 +38,19 @@ func jobStore() (*jobs.Store, error) {
 // JobView is one row of the Attività list. It is the state plus the couple of
 // facts only the window can work out.
 type JobView struct {
-	JobID          string   `json:"jobId"`
-	Label          string   `json:"label"`
-	Status         string   `json:"status"`
-	Alive          bool     `json:"alive"`
-	StartedAt      string   `json:"startedAt"`
-	FinishedAt     string   `json:"finishedAt"`
-	Summary        string   `json:"summary"`
-	Issues         []string `json:"issues"`
+	JobID      string   `json:"jobId"`
+	Label      string   `json:"label"`
+	Status     string   `json:"status"`
+	Alive      bool     `json:"alive"`
+	StartedAt  string   `json:"startedAt"`
+	FinishedAt string   `json:"finishedAt"`
+	Summary    string   `json:"summary"`
+	Issues     []string `json:"issues"`
+	// ProfileIDs is what lets the profile list show a status dot again. With
+	// jobs detached, the runner no longer emits per-profile events to this
+	// window — it may not even have been the window that started them — so the
+	// cards derive their state from the jobs on disk instead.
+	ProfileIDs     []string `json:"profileIds"`
 	CurrentProfile string   `json:"currentProfile"`
 	CurrentDest    string   `json:"currentDest"`
 	HasLog         bool     `json:"hasLog"`
@@ -72,8 +77,14 @@ func (a *App) ListJobs() ([]JobView, error) {
 		if _, err := os.Stat(p.Log); err == nil {
 			hasLog = true
 		}
+		ids := make([]string, 0, len(st.Profiles))
+		for _, pr := range st.Profiles {
+			if pr.ID != "" {
+				ids = append(ids, pr.ID)
+			}
+		}
 		v := JobView{
-			JobID: st.JobID, Label: st.Label, Status: st.Status,
+			JobID: st.JobID, Label: st.Label, Status: st.Status, ProfileIDs: ids,
 			// Only running states are worth a lock check: it opens a file and
 			// asks the kernel, and doing it for every finished job in the
 			// history would be a syscall storm once a second.

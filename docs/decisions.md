@@ -110,6 +110,33 @@ byte invece di megabyte di righe "file trasferito".
 Cancellare il log di una copia in corso sarebbe il modo più stupido di rompere questa
 funzione, e c'è un test apposta.
 
+**Corretto nella 2.3.2**: la 2.3.0 *cancellava* il log di una copia riuscita, non lo
+riduceva. L'effetto pratico era che finita una copia non si poteva più guardare cosa
+avesse fatto — e la prima cosa che si vuole fare quando un backup finisce è proprio
+quella. L'obiettivo della ritenzione è che la cartella non cresca senza limite, non
+distruggere le prove. Ora di una copia riuscita resta la **coda** del log (64 KB):
+cinquanta job di storia fanno pochi megabyte, contro le centinaia che una singola
+esecuzione verbosa può produrre. Quello che è fallito conserva il log intero, perché
+è lì che sta la risposta.
+
+---
+
+## 5-bis. Lo stato dei profili si ricava dai job su disco (2.3.2)
+
+**Deciso**: il pallino di stato su ogni profilo, e il fatto che l'app sia occupata, si
+ricavano dai file dei job, non da eventi emessi durante l'esecuzione.
+
+**Perché**: fino alla 2.2 lo stato arrivava da eventi `run:status` emessi dal runner
+mentre lavorava dentro la finestra. Col detach non c'è più niente da emettere — la
+copia può benissimo essere stata avviata da una finestra che non esiste più — e infatti
+nella 2.3.0 i pallini erano rimasti spenti, i pulsanti "Avvia" non si disabilitavano
+più durante una copia e "Interrompi" non compariva. Leggendo dai job si recupera tutto,
+e in più **lo stato sopravvive alla chiusura dell'app**: riaprendola si vede ancora com'è
+andata l'ultima copia di ogni profilo, cosa che prima si perdeva.
+
+**Conseguenza**: ogni job registra quali profili ha toccato (`profileIds`), e il job più
+recente che nomina un profilo è quello che ne descrive lo stato.
+
 ---
 
 ## 6. "Segui", non "Riprendi"
