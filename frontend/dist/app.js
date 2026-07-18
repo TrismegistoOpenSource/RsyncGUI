@@ -53,6 +53,59 @@ function showBanner(msg, isError) {
   bannerTimer = setTimeout(() => { b.hidden = true; }, 6000);
 }
 
+// askConfirm shows the shared confirmation dialog and resolves to null when the
+// user backs out, or to { checked } when they go ahead — checked being the
+// state of the optional extra switch (used for --delete on a restore).
+//
+// Every caller is about to do something that can destroy data, so the dialog
+// always spells out the actual paths involved instead of a generic "are you
+// sure": the mistake to prevent is restoring the right way onto the wrong
+// folder, and only the paths reveal that.
+function askConfirm({ title, bodyHtml, confirmLabel, checkboxLabel }) {
+  return new Promise((resolve) => {
+    const overlay = $("confirm");
+    const check = $("confirm-check");
+    const checkInput = $("confirm-check-input");
+
+    $("confirm-title").textContent = title;
+    $("confirm-body").innerHTML = bodyHtml;
+    $("confirm-ok").textContent = confirmLabel;
+
+    checkInput.checked = false;
+    check.hidden = !checkboxLabel;
+    if (checkboxLabel) $("confirm-check-label").textContent = checkboxLabel;
+
+    const done = (result) => {
+      overlay.hidden = true;
+      $("confirm-ok").removeEventListener("click", onOk);
+      $("confirm-cancel").removeEventListener("click", onCancel);
+      overlay.removeEventListener("click", onBackdrop);
+      // must match the capture flag used when adding, or it is not removed
+      document.removeEventListener("keydown", onKey, true);
+      resolve(result);
+    };
+    const onOk = () => done({ checked: checkInput.checked });
+    const onCancel = () => done(null);
+    const onBackdrop = (e) => { if (e.target === overlay) done(null); };
+    const onKey = (e) => {
+      if (e.key !== "Escape") return;
+      // This dialog can sit on top of the editor: stop the editor's own
+      // Escape handler from closing that too.
+      e.stopPropagation();
+      done(null);
+    };
+
+    $("confirm-ok").addEventListener("click", onOk);
+    $("confirm-cancel").addEventListener("click", onCancel);
+    overlay.addEventListener("click", onBackdrop);
+    // capture phase, so it runs before the editor's keydown listener
+    document.addEventListener("keydown", onKey, true);
+
+    overlay.hidden = false;
+    $("confirm-cancel").focus();
+  });
+}
+
 // ---- rendering --------------------------------------------------------------
 
 function render() {
@@ -171,6 +224,7 @@ function profileCard(p, draggable) {
   if (p.options.compress) opts.push("-z");
   if (p.options.verbose) opts.push("-v");
   if (p.options.inplace) opts.push("--inplace");
+  if (p.options.recreateStructure) opts.push("struttura");
   const nCustom = (p.options.customExcludes || []).length;
   if (p.options.excludeSystemFiles !== false || nCustom > 0) {
     opts.push(nCustom > 0 ? `--exclude ×${nCustom + (p.options.excludeSystemFiles !== false ? 1 : 0)}` : "--exclude");
@@ -206,7 +260,26 @@ function profileCard(p, draggable) {
     try { await api().RunOne(p.id); } catch (err) { showBanner(String(err), true); }
   });
 
-  actions.append(btnEdit, btnRun);
+  actions.append(btnEdit);
+
+  // Restore is only meaningful when the reverse copy is unambiguous, which is
+  // exactly the one-source/one-destination case (see restorePlan in app.go).
+  // On any other profile the button would have to guess where each file came
+  // from, so it isn't offered at all rather than offered and refused.
+  if (p.sources.length === 1 && p.destinations.length === 1) {
+    const btnRestore = document.createElement("button");
+    btnRestore.className = "btn ghost small";
+    btnRestore.textContent = "Ripristina";
+    btnRestore.title = "Copia al contrario: dal backup verso la cartella originale";
+    btnRestore.disabled = state.busy;
+    btnRestore.addEventListener("click", (e) => {
+      e.stopPropagation();
+      onRestore(p);
+    });
+    actions.append(btnRestore);
+  }
+
+  actions.append(btnRun);
 
   // Only the profile actually running can be stopped, so the button lives on
   // that row, next to its (disabled) Avvia.
@@ -231,6 +304,60 @@ function profileCard(p, draggable) {
   });
 
   return card;
+}
+
+// ---- restore -----------------------------------------------------------------
+
+// onRestore runs the copy backwards: from the backup onto the originals. The
+// exact paths come from the backend, which knows whether the data sits in the
+// destination root or one level down in <dest>/<nome> (ricrea struttura).
+async function onRestore(p) {
+  let plan;
+  try {
+    plan = await api().RestorePlanFor(p.id);
+  } catch (e) {
+    showBanner(String(e), true);
+    return;
+  }
+  if (!plan.allowed) {
+    showBanner(plan.reason, true);
+    return;
+  }
+
+  const answer = await askConfirm({
+    title: "Ripristinare dal backup?",
+    bodyHtml:
+      `La copia viene eseguita <strong>al contrario</strong>: i file del backup vengono riportati ` +
+      `nella cartella originale, sovrascrivendo le versioni che si trovano lì.` +
+      `<span class="path">Dal backup: ${escapeHtml(plan.from)}</span>` +
+      `<span class="path">Alla cartella originale: ${escapeHtml(plan.to)}</span>`,
+    confirmLabel: "Ripristina",
+    checkboxLabel: "Elimina dall'originale i file che il backup non contiene (--delete)",
+  });
+  if (!answer) return;
+
+  // --delete going this way is the genuinely destructive combination: it wipes
+  // from the user's own folder everything created since the backup was made.
+  // One click is not enough consent for that.
+  if (answer.checked) {
+    const second = await askConfirm({
+      title: "Confermi l'eliminazione durante il ripristino?",
+      bodyHtml:
+        `Ogni file presente in <strong>${escapeHtml(plan.to)}</strong> che non esiste nel backup ` +
+        `verrà <strong>eliminato</strong>, compreso tutto ciò che hai creato dopo l'ultima copia.` +
+        `<span class="warn">Se il backup non è aggiornatissimo, questa operazione fa perdere dati. ` +
+        `Nel dubbio, annulla e ripristina senza eliminazione.</span>`,
+      confirmLabel: "Elimina e ripristina",
+    });
+    if (!second) return;
+  }
+
+  openLog();
+  try {
+    await api().RunRestore(p.id, answer.checked);
+  } catch (e) {
+    showBanner(String(e), true);
+  }
 }
 
 // ---- drag & drop (manual mode only) -----------------------------------------
@@ -307,7 +434,11 @@ function pathRow(listEl, value, browseTitle) {
   browse.addEventListener("click", async (e) => {
     e.preventDefault();
     const dir = await api().ChooseDirectory(browseTitle);
-    if (dir) input.value = dir;
+    if (!dir) return;
+    input.value = dir;
+    // Setting .value from script fires no event, and the "ricrea struttura"
+    // example quotes these paths — tell the listeners explicitly.
+    input.dispatchEvent(new Event("input", { bubbles: true }));
   });
 
   const remove = document.createElement("button");
@@ -330,6 +461,75 @@ function listValues(listEl) {
     .filter((v) => v !== "");
 }
 
+// ---- ricrea struttura --------------------------------------------------------
+
+let recreateWasOnAtOpen = false;
+
+// lastSegment mirrors pathBase in app.go: the folder name rsync would recreate.
+function lastSegment(path) {
+  const s = String(path).replace(/\/+$/, "");
+  const slash = s.lastIndexOf("/");
+  if (slash >= 0) return s.slice(slash + 1);
+  const colon = s.lastIndexOf(":");
+  return colon >= 0 ? s.slice(colon + 1) : s;
+}
+
+// syncRecreateRow repaints the row (grey/red) and shows, with the profile's own
+// paths, where the files will actually land. The abstract description of the
+// option is easy to misread; the concrete example is not.
+function syncRecreateRow() {
+  const on = $("f-recreate").checked;
+  $("recreate-row").classList.toggle("on", on);
+
+  const src = listValues($("src-list"))[0] || "";
+  const dest = listValues($("dest-list"))[0] || "";
+  const example = $("recreate-example");
+
+  if (!src || !dest) {
+    example.textContent = on
+      ? "cartella di origine ricreata nella destinazione"
+      : "contenuto riversato direttamente nella destinazione";
+    return;
+  }
+
+  const name = lastSegment(src) || "cartella";
+  const cleanDest = dest.replace(/\/+$/, "");
+  example.textContent = on
+    ? `${name} → ${cleanDest}/${name}/…`
+    : `contenuto di ${name} → ${cleanDest}/…`;
+}
+
+// confirmRecreateOff explains what switching the option back off does to a
+// profile that has already run with it on. With --delete the previously copied
+// <dest>/<nome> becomes "extra" for rsync and gets removed — a backup deleted
+// by a checkbox. Without --delete nothing is deleted, but the destination ends
+// up holding both layouts, which is its own mess.
+async function confirmRecreateOff() {
+  const src = listValues($("src-list"))[0] || "";
+  const dest = listValues($("dest-list"))[0] || "";
+  const name = lastSegment(src) || "cartella";
+  const cleanDest = (dest || "destinazione").replace(/\/+$/, "");
+  const withDelete = $("f-delete").checked;
+
+  const consequence = withDelete
+    ? `<span class="warn">Il profilo ha <strong>--delete</strong> attivo: alla prossima copia ` +
+      `<strong>${escapeHtml(cleanDest)}/${escapeHtml(name)}</strong> risulterà un file di troppo ` +
+      `e verrà <strong>eliminato</strong>. Il backup già presente andrebbe perso.</span>`
+    : `<span class="warn">Alla prossima copia il contenuto verrà riversato direttamente in ` +
+      `<strong>${escapeHtml(cleanDest)}</strong>, lasciando anche la vecchia cartella ` +
+      `<strong>${escapeHtml(name)}</strong>: la destinazione conterrà due copie con strutture diverse.</span>`;
+
+  const answer = await askConfirm({
+    title: "Disattivare «Ricrea struttura»?",
+    bodyHtml:
+      `Questo profilo copia già ricreando la cartella dentro la destinazione. ` +
+      `Spegnere l'opzione ora cambia il punto in cui i file vengono scritti.` +
+      consequence,
+    confirmLabel: "Disattiva comunque",
+  });
+  return answer !== null;
+}
+
 function openEditor(profile) {
   state.editingId = profile ? profile.id : null;
   $("modal-title").textContent = profile ? "Modifica destinazione" : "Nuova destinazione";
@@ -341,6 +541,10 @@ function openEditor(profile) {
   $("f-compress").checked = !!profile?.options.compress;
   $("f-verbose").checked = !!profile?.options.verbose;
   $("f-inplace").checked = !!profile?.options.inplace;
+  $("f-recreate").checked = !!profile?.options.recreateStructure;
+  // Remembered so the warning only fires when switching off something that has
+  // already been used for real copies, not on a brand new profile.
+  recreateWasOnAtOpen = !!profile?.options.recreateStructure;
   // On for new profiles, and for old ones saved before the option existed
   // (the backend defaults the missing key to true as well).
   $("f-sysexcl").checked = profile ? profile.options.excludeSystemFiles !== false : true;
@@ -358,6 +562,10 @@ function openEditor(profile) {
   }
 
   $("tag-suggestions").hidden = true;
+
+  // After the path rows exist: the example quotes them, and reading them any
+  // earlier would only ever find the lists empty.
+  syncRecreateRow();
 
   $("modal").hidden = false;
   $("f-name").focus();
@@ -428,6 +636,7 @@ async function saveEditor() {
       compress: $("f-compress").checked,
       verbose: $("f-verbose").checked,
       inplace: $("f-inplace").checked,
+      recreateStructure: $("f-recreate").checked,
       excludeSystemFiles: $("f-sysexcl").checked,
       customExcludes: $("f-excludes").value.split(",").map((s) => s.trim()).filter(Boolean),
     },
@@ -489,6 +698,22 @@ function wire() {
     localStorage.setItem("sortMode", state.sortMode);
     render();
   });
+
+  // The checkbox has already flipped by the time "change" fires, so a refused
+  // confirmation puts it back on.
+  $("f-recreate").addEventListener("change", async (e) => {
+    if (!e.target.checked && recreateWasOnAtOpen) {
+      if (!(await confirmRecreateOff())) {
+        e.target.checked = true;
+      }
+    }
+    syncRecreateRow();
+  });
+  // The live example quotes the paths, so it has to follow them as they change.
+  $("f-delete").addEventListener("change", syncRecreateRow);
+  for (const list of ["src-list", "dest-list"]) {
+    $(list).addEventListener("input", syncRecreateRow);
+  }
 
   $("btn-cancel").addEventListener("click", closeEditor);
   $("btn-save").addEventListener("click", saveEditor);

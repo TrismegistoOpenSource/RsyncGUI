@@ -27,6 +27,14 @@ type SyncOptions struct {
 	Compress bool `json:"compress"`
 	Verbose  bool `json:"verbose"`
 	Inplace  bool `json:"inplace"`
+	// RecreateStructure copies the source folder itself into the destination
+	// instead of pouring its contents in: /A → /B becomes /B/A. It is rsync's
+	// trailing-slash rule (see rsyncArgs), exposed as a switch.
+	//
+	// Turning it off again on a profile that ran with it on is destructive when
+	// Delete is also set: the previously written /B/A becomes "extra" and rsync
+	// removes it. That is why the UI warns before letting it be switched off.
+	RecreateStructure bool `json:"recreateStructure"`
 	// ExcludeSystemFiles defaults to true, including for profiles saved before
 	// this option existed — see UnmarshalJSON.
 	ExcludeSystemFiles bool     `json:"excludeSystemFiles"`
@@ -489,6 +497,166 @@ func (a *App) RunUntagged() error {
 	return a.enqueue(list)
 }
 
+// --- restore -------------------------------------------------------------------
+
+// RestorePlan describes what a restore would do, so the UI can spell it out
+// before anything is written. Allowed is false when the reverse copy would be
+// ambiguous, and Reason then says why.
+type RestorePlan struct {
+	Allowed          bool   `json:"allowed"`
+	Reason           string `json:"reason"`
+	ProfileName      string `json:"profileName"`
+	From             string `json:"from"`
+	To               string `json:"to"`
+	ProfileHasDelete bool   `json:"profileHasDelete"`
+}
+
+// pathBase returns the last element of a path, for local and rsync remote
+// specs (host:/path) alike. filepath.Base is not enough: on Windows it splits
+// on "\" and would mangle a remote path, and the caller may hand us a value
+// with a trailing slash.
+func pathBase(p string) string {
+	s := strings.TrimRight(p, "/")
+	if i := strings.LastIndexAny(s, "/"); i >= 0 {
+		return s[i+1:]
+	}
+	if i := strings.LastIndex(s, ":"); i >= 0 {
+		return s[i+1:]
+	}
+	return s
+}
+
+// pathJoin appends a child name to a path without assuming the local
+// separator, so remote specs keep working.
+func pathJoin(base, child string) string {
+	return strings.TrimRight(base, "/") + "/" + child
+}
+
+// restorePlan works out the reverse of a profile's copy.
+//
+// Restore is only offered on profiles with exactly one source and one
+// destination. With several sources rsync merges their contents into the
+// destination, and nothing in the result records which file came from where,
+// so there is no way to send them back that isn't a guess — and a wrong guess
+// overwrites the user's originals.
+//
+// The backup to read from depends on how the copy was written: with
+// RecreateStructure the data sits in <dest>/<source name>, otherwise directly
+// in <dest>. Either way the restore writes into the original source path, and
+// always in "contents" mode (trailing slash) so the folder itself is not
+// nested one level deeper on the way back.
+func restorePlan(p SyncProfile) RestorePlan {
+	plan := RestorePlan{ProfileName: p.Name, ProfileHasDelete: p.Options.Delete}
+
+	if len(p.Sources) != 1 || len(p.Destinations) != 1 {
+		plan.Reason = "Il ripristino è disponibile solo sui profili con una sola sorgente e una sola destinazione: " +
+			"con più percorsi le copie si mescolano nella destinazione e non è più possibile sapere da dove veniva ogni file."
+		return plan
+	}
+
+	source, dest := p.Sources[0], p.Destinations[0]
+	if source == "" || dest == "" {
+		plan.Reason = "Il profilo non ha una sorgente e una destinazione valide."
+		return plan
+	}
+
+	backup := dest
+	if p.Options.RecreateStructure {
+		backup = pathJoin(dest, pathBase(source))
+	}
+
+	plan.Allowed = true
+	plan.From = backup
+	plan.To = source
+	return plan
+}
+
+// RestorePlanFor is the frontend's way to ask what a restore would do.
+func (a *App) RestorePlanFor(id string) (RestorePlan, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, p := range a.profiles {
+		if p.ID == id {
+			return restorePlan(p), nil
+		}
+	}
+	return RestorePlan{}, errors.New("destinazione non trovata")
+}
+
+// RunRestore copies the backup back over the original: destination → source.
+//
+// withDelete is asked for every single time in the UI rather than taken from
+// the profile, because it means something far more dangerous in this direction:
+// forward it prunes the backup, backward it deletes from the user's own data
+// everything the backup does not have — every file created since the last copy.
+func (a *App) RunRestore(id string, withDelete bool) error {
+	a.mu.Lock()
+	var target *SyncProfile
+	for i := range a.profiles {
+		if a.profiles[i].ID == id {
+			p := a.profiles[i]
+			target = &p
+			break
+		}
+	}
+	a.mu.Unlock()
+	if target == nil {
+		return errors.New("destinazione non trovata")
+	}
+
+	plan := restorePlan(*target)
+	if !plan.Allowed {
+		return errors.New(plan.Reason)
+	}
+	if !sourceAvailable(plan.From) {
+		return fmt.Errorf("il backup da cui ripristinare non è raggiungibile: %s", plan.From)
+	}
+	// Restoring from an empty backup is almost certainly a mistake (wrong
+	// volume, or a destination that was never written). Harmless without
+	// --delete, but with it the original folder gets emptied — refuse instead.
+	if withDelete {
+		empty, err := dirLooksEmpty(plan.From)
+		if err == nil && empty {
+			return fmt.Errorf("il backup %s risulta vuoto: un ripristino con eliminazione svuoterebbe %s", plan.From, plan.To)
+		}
+	}
+
+	// The reverse run is built here rather than reusing the profile's own
+	// options: paths are already in contents mode, so RecreateStructure must
+	// be off, and Delete follows what the user just confirmed.
+	opts := target.Options
+	opts.RecreateStructure = false
+	opts.Delete = withDelete
+
+	restoreProfile := SyncProfile{
+		ID:           target.ID,
+		Name:         target.Name + " (ripristino)",
+		Sources:      []string{strings.TrimRight(plan.From, "/") + "/"},
+		Destinations: []string{plan.To},
+		Tag:          target.Tag,
+		Options:      opts,
+	}
+	return a.enqueue([]SyncProfile{restoreProfile})
+}
+
+// dirLooksEmpty reports whether a local directory holds no entries at all.
+// Remote paths can't be inspected from here, so they're never called empty.
+func dirLooksEmpty(dir string) (bool, error) {
+	if isRemote(dir) {
+		return false, nil
+	}
+	f, err := os.Open(dir)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	names, err := f.Readdirnames(1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false, err
+	}
+	return len(names) == 0, nil
+}
+
 // --- path availability --------------------------------------------------------
 
 // isRemote reports whether a path is an rsync remote spec (host:path or
@@ -577,43 +745,47 @@ func (a *App) enqueue(list []SyncProfile) error {
 	a.mu.Unlock()
 
 	go func() {
-		runtime.EventsEmit(a.ctx, "run:busy", true)
+		a.emitEvent("run:busy", true)
 		defer func() {
 			cancel() // release the context even on a normal finish
 			a.mu.Lock()
 			a.busy = false
 			a.abort = nil
 			a.mu.Unlock()
-			runtime.EventsEmit(a.ctx, "run:busy", false)
+			a.emitEvent("run:busy", false)
 		}()
 
 		var allIssues []string
 		for _, p := range list {
 			// Stop between profiles too: aborting must not start the next one.
 			if runCtx.Err() != nil {
-				runtime.EventsEmit(a.ctx, "run:status", statusEvent{ID: p.ID, Status: "aborted"})
+				a.emitEvent("run:status", statusEvent{ID: p.ID, Status: "aborted"})
 				continue
 			}
 
-			runtime.EventsEmit(a.ctx, "run:status", statusEvent{ID: p.ID, Status: "running"})
+			a.emitEvent("run:status", statusEvent{ID: p.ID, Status: "running"})
 			a.emitLog(fmt.Sprintf("\n═══ %s ═══\n", p.Name))
 
 			completed, issues := a.runProfile(runCtx, p)
 
 			if runCtx.Err() != nil {
-				runtime.EventsEmit(a.ctx, "run:status", statusEvent{ID: p.ID, Status: "aborted"})
+				a.emitEvent("run:status", statusEvent{ID: p.ID, Status: "aborted"})
 				continue
 			}
 
 			allIssues = append(allIssues, issues...)
+			detail := strings.Join(issues, "; ")
+			var status string
 			switch {
 			case len(issues) == 0:
-				runtime.EventsEmit(a.ctx, "run:status", statusEvent{ID: p.ID, Status: "success"})
+				status = "success"
 			case completed > 0:
-				runtime.EventsEmit(a.ctx, "run:status", statusEvent{ID: p.ID, Status: "partial", Message: strings.Join(issues, "; ")})
+				status = "partial"
 			default:
-				runtime.EventsEmit(a.ctx, "run:status", statusEvent{ID: p.ID, Status: "failed", Message: strings.Join(issues, "; ")})
+				status = "failed"
 			}
+			a.emitEvent("run:status", statusEvent{ID: p.ID, Status: status, Message: detail})
+			a.notifyForStatus(status, p.Name, detail)
 		}
 
 		switch {
@@ -664,14 +836,14 @@ func (a *App) VerifyFolder(root string) error {
 	a.mu.Unlock()
 
 	go func() {
-		runtime.EventsEmit(a.ctx, "run:busy", true)
+		a.emitEvent("run:busy", true)
 		defer func() {
 			cancel()
 			a.mu.Lock()
 			a.busy = false
 			a.abort = nil
 			a.mu.Unlock()
-			runtime.EventsEmit(a.ctx, "run:busy", false)
+			a.emitEvent("run:busy", false)
 		}()
 
 		a.emitLog(fmt.Sprintf("\n═══ Verifica: %s ═══\n", root))
@@ -734,11 +906,19 @@ func (a *App) verifyWalk(runCtx context.Context, root string) (scanned int, brok
 }
 
 func (a *App) emitLog(text string) {
-	// No window attached yet (or under test): nothing to emit to.
+	a.emitEvent("run:log", text)
+}
+
+// emitEvent is the single door to the frontend event bus. Wails aborts the
+// process when EventsEmit gets a context other than the one from the lifecycle
+// hooks, so every emission goes through here: with no window attached — before
+// startup, or under test, where the runner drives the queue directly — the
+// event simply has nowhere to go and is dropped.
+func (a *App) emitEvent(name string, data ...interface{}) {
 	if a.ctx == nil {
 		return
 	}
-	runtime.EventsEmit(a.ctx, "run:log", text)
+	runtime.EventsEmit(a.ctx, name, data...)
 }
 
 // runProfile syncs all available sources into each available destination,
@@ -858,9 +1038,19 @@ func rsyncArgs(opts SyncOptions, sources []string, dest string) []string {
 		}
 	}
 
-	// A directory source syncs its *contents* (trailing slash), matching 1.x.
+	// rsync decides between "copy this folder" and "copy what's inside it" from
+	// a single trailing slash: `rsync /A /B` writes /B/A, `rsync /A/ /B` pours
+	// A's contents straight into /B. RecreateStructure picks which one.
+	//
+	// Default (off) keeps the contents behaviour of 1.x. On, the slash is
+	// stripped instead of added, so a path stored with one still recreates the
+	// folder; "/" itself is left alone, as it has no folder name to recreate.
 	for _, src := range sources {
-		if fi, statErr := os.Stat(src); statErr == nil && fi.IsDir() && !strings.HasSuffix(src, "/") {
+		if opts.RecreateStructure {
+			if trimmed := strings.TrimRight(src, "/"); trimmed != "" {
+				src = trimmed
+			}
+		} else if fi, statErr := os.Stat(src); statErr == nil && fi.IsDir() && !strings.HasSuffix(src, "/") {
 			src += "/"
 		}
 		args = append(args, src)

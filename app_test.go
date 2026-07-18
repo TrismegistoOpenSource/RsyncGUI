@@ -518,3 +518,344 @@ func TestDestAvailableRejectsUnreadableParent(t *testing.T) {
 		t.Fatal("una sorgente non leggibile non è disponibile")
 	}
 }
+
+// --- ricrea struttura ---------------------------------------------------------
+
+// RecreateStructure is the trailing-slash rule: without the slash rsync copies
+// the folder itself, so the source name must survive into the arguments.
+func TestRsyncArgsRecreateStructureOmitsTrailingSlash(t *testing.T) {
+	dir := t.TempDir()
+	args := rsyncArgs(SyncOptions{RecreateStructure: true}, []string{dir}, "/dst")
+	src := args[len(args)-2]
+	if strings.HasSuffix(src, "/") {
+		t.Fatalf("con RecreateStructure la sorgente non deve avere lo slash finale: %q", src)
+	}
+	if src != dir {
+		t.Fatalf("sorgente = %q, attesa %q", src, dir)
+	}
+}
+
+// A path the user typed (or an older profile stored) with a trailing slash must
+// still recreate the folder, otherwise the switch would silently do nothing.
+func TestRsyncArgsRecreateStructureStripsStoredSlash(t *testing.T) {
+	args := rsyncArgs(SyncOptions{RecreateStructure: true}, []string{"/data/A/"}, "/dst")
+	if src := args[len(args)-2]; src != "/data/A" {
+		t.Fatalf("sorgente = %q, attesa /data/A", src)
+	}
+}
+
+// "/" has no folder name to recreate; stripping it would produce an empty
+// argument and rsync would read the current directory instead.
+func TestRsyncArgsRecreateStructureLeavesRootAlone(t *testing.T) {
+	args := rsyncArgs(SyncOptions{RecreateStructure: true}, []string{"/"}, "/dst")
+	if src := args[len(args)-2]; src != "/" {
+		t.Fatalf("sorgente = %q, attesa /", src)
+	}
+}
+
+// End-to-end with real rsync: this is the behaviour the user asked for —
+// copying /A into /B must produce /B/A/…, not /B/… .
+func TestRecreateStructureEndToEnd(t *testing.T) {
+	if _, err := exec.LookPath("rsync"); err != nil {
+		t.Skip("rsync non disponibile")
+	}
+
+	root := t.TempDir()
+	srcParent := filepath.Join(root, "origine")
+	srcA := filepath.Join(srcParent, "A")
+	if err := os.MkdirAll(filepath.Join(srcA, "sotto"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcA, "sotto", "file.txt"), []byte("dati"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(root, "B")
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	a := NewApp()
+	if _, err := a.execRsync(context.Background(), SyncOptions{RecreateStructure: true}, []string{srcA}, dst); err != nil {
+		t.Fatal(err)
+	}
+
+	want := filepath.Join(dst, "A", "sotto", "file.txt")
+	if _, err := os.Stat(want); err != nil {
+		t.Fatalf("atteso %s, non trovato: %v", want, err)
+	}
+	// And the contents must NOT have been poured into /B directly.
+	if _, err := os.Stat(filepath.Join(dst, "sotto")); err == nil {
+		t.Fatal("il contenuto è finito direttamente in /B: la cartella contenitore non è stata ricreata")
+	}
+}
+
+// The default (off) must keep behaving exactly as before: contents poured in.
+func TestWithoutRecreateStructureContentsArePouredIn(t *testing.T) {
+	if _, err := exec.LookPath("rsync"); err != nil {
+		t.Skip("rsync non disponibile")
+	}
+
+	root := t.TempDir()
+	srcA := filepath.Join(root, "A")
+	if err := os.MkdirAll(srcA, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcA, "file.txt"), []byte("dati"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(root, "B")
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	a := NewApp()
+	if _, err := a.execRsync(context.Background(), SyncOptions{}, []string{srcA}, dst); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "file.txt")); err != nil {
+		t.Fatalf("senza RecreateStructure il contenuto deve finire in /B: %v", err)
+	}
+}
+
+// --- ripristino ---------------------------------------------------------------
+
+func TestRestorePlanRejectsAmbiguousProfiles(t *testing.T) {
+	cases := []struct {
+		name string
+		p    SyncProfile
+	}{
+		{"due sorgenti", SyncProfile{Sources: []string{"/a", "/b"}, Destinations: []string{"/d"}}},
+		{"due destinazioni", SyncProfile{Sources: []string{"/a"}, Destinations: []string{"/d", "/e"}}},
+		{"nessuna sorgente", SyncProfile{Destinations: []string{"/d"}}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if plan := restorePlan(c.p); plan.Allowed {
+				t.Fatal("il ripristino non deve essere permesso su un profilo ambiguo")
+			}
+		})
+	}
+}
+
+// Without RecreateStructure the backup sits directly in the destination, and
+// must go back into the original source folder.
+func TestRestorePlanWithoutRecreateStructure(t *testing.T) {
+	p := SyncProfile{
+		Sources:      []string{"/home/me/A"},
+		Destinations: []string{"/Volumes/Backup"},
+	}
+	plan := restorePlan(p)
+	if !plan.Allowed {
+		t.Fatalf("atteso permesso, motivo: %s", plan.Reason)
+	}
+	if plan.From != "/Volumes/Backup" {
+		t.Errorf("From = %q, atteso /Volumes/Backup", plan.From)
+	}
+	if plan.To != "/home/me/A" {
+		t.Errorf("To = %q, atteso /home/me/A", plan.To)
+	}
+}
+
+// With RecreateStructure the backup is one level deeper, in <dest>/<nome>.
+// Reading from the destination root instead would restore the wrong tree.
+func TestRestorePlanWithRecreateStructure(t *testing.T) {
+	p := SyncProfile{
+		Sources:      []string{"/home/me/A"},
+		Destinations: []string{"/Volumes/Backup"},
+		Options:      SyncOptions{RecreateStructure: true},
+	}
+	plan := restorePlan(p)
+	if !plan.Allowed {
+		t.Fatalf("atteso permesso, motivo: %s", plan.Reason)
+	}
+	if plan.From != "/Volumes/Backup/A" {
+		t.Errorf("From = %q, atteso /Volumes/Backup/A", plan.From)
+	}
+	if plan.To != "/home/me/A" {
+		t.Errorf("To = %q, atteso /home/me/A", plan.To)
+	}
+}
+
+func TestPathBaseHandlesRemoteAndTrailingSlash(t *testing.T) {
+	cases := map[string]string{
+		"/home/me/A":         "A",
+		"/home/me/A/":        "A",
+		"user@host:/data/A":  "A",
+		"user@host:/data/A/": "A",
+	}
+	for in, want := range cases {
+		if got := pathBase(in); got != want {
+			t.Errorf("pathBase(%q) = %q, atteso %q", in, got, want)
+		}
+	}
+}
+
+// The dangerous case: restoring with --delete from a backup that is empty
+// (wrong volume, or a destination never written) would wipe the original.
+func TestRunRestoreRefusesEmptyBackupWithDelete(t *testing.T) {
+	t.Setenv("RSYNCGUI_CONFIG_DIR", t.TempDir())
+
+	root := t.TempDir()
+	source := filepath.Join(root, "originale")
+	backup := filepath.Join(root, "backup")
+	for _, d := range []string{source, backup} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(source, "prezioso.txt"), []byte("dati"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	a := NewApp()
+	a.profiles = []SyncProfile{{
+		ID: "x", Name: "test",
+		Sources:      []string{source},
+		Destinations: []string{backup},
+	}}
+
+	err := a.RunRestore("x", true)
+	if err == nil {
+		t.Fatal("un ripristino con eliminazione da un backup vuoto deve essere rifiutato")
+	}
+	if _, statErr := os.Stat(filepath.Join(source, "prezioso.txt")); statErr != nil {
+		t.Fatal("il file originale non doveva essere toccato")
+	}
+}
+
+// Same empty backup without --delete is harmless (nothing gets removed), so it
+// must be allowed: refusing it would block a legitimate no-op.
+func TestRunRestoreAllowsEmptyBackupWithoutDelete(t *testing.T) {
+	t.Setenv("RSYNCGUI_CONFIG_DIR", t.TempDir())
+
+	root := t.TempDir()
+	source := filepath.Join(root, "originale")
+	backup := filepath.Join(root, "backup")
+	for _, d := range []string{source, backup} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	a := NewApp()
+	a.profiles = []SyncProfile{{
+		ID: "x", Name: "test",
+		Sources:      []string{source},
+		Destinations: []string{backup},
+	}}
+
+	if err := a.RunRestore("x", false); err != nil {
+		t.Fatalf("un ripristino senza eliminazione non deve essere bloccato: %v", err)
+	}
+	_ = a.Abort()
+}
+
+// End-to-end round trip: copy A → B with structure recreation, lose a file in
+// the original, restore it back. This is the whole feature working together.
+func TestRestoreRoundTripWithRecreateStructure(t *testing.T) {
+	if _, err := exec.LookPath("rsync"); err != nil {
+		t.Skip("rsync non disponibile")
+	}
+
+	root := t.TempDir()
+	source := filepath.Join(root, "A")
+	backup := filepath.Join(root, "B")
+	if err := os.MkdirAll(filepath.Join(source, "sotto"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(backup, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := filepath.Join(source, "sotto", "prezioso.txt")
+	if err := os.WriteFile(original, []byte("contenuto originale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	a := NewApp()
+	p := SyncProfile{
+		Name:         "test",
+		Sources:      []string{source},
+		Destinations: []string{backup},
+		Options:      SyncOptions{RecreateStructure: true},
+	}
+
+	// forward copy
+	if _, err := a.execRsync(context.Background(), p.Options, p.Sources, backup); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(backup, "A", "sotto", "prezioso.txt")); err != nil {
+		t.Fatalf("il backup non contiene la struttura attesa: %v", err)
+	}
+
+	// the user loses the file
+	if err := os.Remove(original); err != nil {
+		t.Fatal(err)
+	}
+
+	// restore, using exactly the paths the plan computes
+	plan := restorePlan(p)
+	if !plan.Allowed {
+		t.Fatalf("ripristino non permesso: %s", plan.Reason)
+	}
+	restoreOpts := p.Options
+	restoreOpts.RecreateStructure = false
+	if _, err := a.execRsync(context.Background(), restoreOpts,
+		[]string{strings.TrimRight(plan.From, "/") + "/"}, plan.To); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(original)
+	if err != nil {
+		t.Fatalf("il file non è stato ripristinato al percorso originale: %v", err)
+	}
+	if string(got) != "contenuto originale" {
+		t.Fatalf("contenuto ripristinato = %q", got)
+	}
+}
+
+// --- notifiche ----------------------------------------------------------------
+
+func TestStatusNotification(t *testing.T) {
+	if msg := statusNotification("success", "Backup", ""); !strings.Contains(msg, "Backup") || !strings.Contains(msg, "completata") {
+		t.Errorf("notifica di successo inattesa: %q", msg)
+	}
+	if msg := statusNotification("partial", "Backup", "un file saltato"); !strings.Contains(msg, "Backup") {
+		t.Errorf("notifica parziale inattesa: %q", msg)
+	}
+	if msg := statusNotification("failed", "Backup", "destinazione irraggiungibile"); !strings.Contains(msg, "destinazione irraggiungibile") {
+		t.Errorf("la notifica di errore deve riportare il motivo: %q", msg)
+	}
+	if msg := statusNotification("failed", "Backup", ""); !strings.Contains(msg, "fallita") {
+		t.Errorf("notifica di errore senza dettaglio inattesa: %q", msg)
+	}
+	// An abort is the user's own doing: no notification.
+	if msg := statusNotification("aborted", "Backup", ""); msg != "" {
+		t.Errorf("un'interruzione volontaria non deve notificare: %q", msg)
+	}
+	if msg := statusNotification("running", "Backup", ""); msg != "" {
+		t.Errorf("uno stato intermedio non deve notificare: %q", msg)
+	}
+}
+
+// A long rsync error must not be pasted whole into a notification body.
+func TestTruncateKeepsNotificationsShort(t *testing.T) {
+	long := strings.Repeat("x", 500)
+	got := truncate(long, 120)
+	if len([]rune(got)) != 120 {
+		t.Fatalf("lunghezza = %d, attesa 120", len([]rune(got)))
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Error("un testo tagliato deve finire con i puntini di sospensione")
+	}
+	if short := truncate("breve", 120); short != "breve" {
+		t.Errorf("un testo corto non va toccato: %q", short)
+	}
+}
+
+// notify must be a no-op without a window rather than a panic: the runner calls
+// it from a goroutine, and a nil context reaching Wails would take the app down.
+func TestNotifyWithoutWindowIsSafe(t *testing.T) {
+	a := NewApp()
+	a.notifyForStatus("success", "Backup", "")
+	a.notify("messaggio")
+}

@@ -26,7 +26,7 @@
         </g>
       </svg>
       <span class="brand-name">RsyncGUI</span>
-      <span class="brand-version">2.1</span>
+      <span class="brand-version">2.2</span>
     </div>
     <div class="titlebar-actions" style="--wails-draggable:no-drag">
       <button class="btn ghost" id="btn-verify" title="Controlla una cartella: trova i file che il sistema elenca ma non riesce davvero ad aprire (letto soltanto, non copia né modifica nulla)">
@@ -125,6 +125,16 @@
         <span class="field-label">Destinazioni <em>(una copia per ciascuna, in sequenza)</em></span>
         <div id="dest-list" class="path-list"></div>
         <button class="btn ghost small add-path" id="btn-add-dest">+ Aggiungi destinazione</button>
+
+        <label class="recreate-row" id="recreate-row">
+          <input type="checkbox" id="f-recreate" />
+          <span class="recreate-led"></span>
+          <span class="recreate-main">
+            <span class="recreate-name">Ricrea struttura</span>
+            <em class="recreate-example" id="recreate-example"></em>
+          </span>
+          <span class="recreate-warn">se abilitata non spegnerla</span>
+        </label>
       </div>
 
       <div class="field">
@@ -160,6 +170,23 @@
       <div class="modal-actions">
         <button class="btn ghost" id="btn-cancel">Annulla</button>
         <button class="btn primary" id="btn-save">Salva</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Reusable confirmation dialog, used wherever an action can destroy data:
+       restoring over the originals, and switching "ricrea struttura" back off. -->
+  <div class="modal-overlay" id="confirm" hidden>
+    <div class="modal confirm-modal">
+      <h2 id="confirm-title"></h2>
+      <div class="confirm-body" id="confirm-body"></div>
+      <label class="switch-row confirm-check" id="confirm-check" hidden>
+        <span id="confirm-check-label"></span>
+        <input type="checkbox" id="confirm-check-input" /><i></i>
+      </label>
+      <div class="modal-actions">
+        <button class="btn ghost" id="confirm-cancel">Annulla</button>
+        <button class="btn danger" id="confirm-ok"></button>
       </div>
     </div>
   </div>
