@@ -269,3 +269,104 @@ func TestDetachedSupervisorGetsNoPipes(t *testing.T) {
 		t.Fatal("il supervisore non deve ereditare pipe dalla finestra")
 	}
 }
+
+// Stopping a detached job goes through a stop FILE, not a signal: on Windows a
+// DETACHED_PROCESS has no console for a Ctrl event to reach, and a file cannot
+// be delivered to a recycled pid by mistake. This drives a real supervisor and
+// stops it mid-copy.
+func TestStopFileAbortsARunningJob(t *testing.T) {
+	if _, err := exec.LookPath("rsync"); err != nil {
+		t.Skip("rsync non disponibile")
+	}
+	bin := buildSelf(t)
+
+	root := t.TempDir()
+	src := filepath.Join(root, "src")
+	dst := filepath.Join(root, "dst")
+	dir := filepath.Join(root, "cfg", "jobs")
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	makeTree(t, src, 20, 400) // 8000 file: abbastanza da essere ancora in corsa
+
+	id := jobs.NewJobID()
+	st := jobs.State{
+		JobID: id, Label: "stop-test", Status: jobs.StatusRunning, StartedAt: time.Now(),
+		Profiles: []jobs.ProfileRun{{
+			Name: "stop-test", Sources: []string{src}, Destinations: []string{dst},
+			Options: []byte(`{"verbose":true}`),
+		}},
+	}
+	if err := jobs.WriteState(dir, st); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(bin, superviseFlag, dir, id)
+	detach(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	cmd.Process.Release()
+
+	store := jobs.NewStore(dir)
+	waitUntil(t, 15*time.Second, func() bool { return store.IsAlive(id) },
+		"il supervisore non è partito")
+
+	// La finestra chiede lo stop scrivendo il file — nessun segnale, come su
+	// Windows.
+	p, _ := store.Paths(id)
+	if err := os.WriteFile(p.Stop, []byte("stop"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	waitUntil(t, 30*time.Second, func() bool {
+		s, err := jobs.ReadState(dir, id)
+		return err == nil && !s.Running()
+	}, "il job non si è fermato dopo la richiesta")
+
+	final, _ := jobs.ReadState(dir, id)
+	if final.Status != jobs.StatusAborted {
+		t.Fatalf("stato = %q, atteso aborted (summary: %s)", final.Status, final.Summary)
+	}
+	if _, err := os.Stat(p.Stop); err == nil {
+		t.Error("il file di stop andava rimosso una volta onorato")
+	}
+	if jobs.IsHeld(store.RunningLockPath()) {
+		t.Error("il lock globale è rimasto preso")
+	}
+}
+
+// Folder verification shares the one-at-a-time gate with detached jobs: with
+// the global lock held (a copy in progress), a verify must be refused — and
+// the in-memory flag alone cannot know that.
+func TestVerifyRefusedWhileDetachedJobRuns(t *testing.T) {
+	t.Setenv("RSYNCGUI_CONFIG_DIR", t.TempDir())
+	a := NewApp()
+
+	store, err := jobStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate, err := jobs.TryLock(store.RunningLockPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gate.Unlock()
+
+	if err := a.VerifyFolder(t.TempDir()); err == nil {
+		t.Fatal("la verifica doveva essere rifiutata con una copia in corso")
+	}
+}
+
+// And the other direction: a window busy verifying must refuse to launch a
+// detached job on top.
+func TestStartDetachedRefusedWhileWindowBusy(t *testing.T) {
+	t.Setenv("RSYNCGUI_CONFIG_DIR", t.TempDir())
+	a := NewApp()
+	a.busy = true // una verifica in corso
+
+	_, err := a.startDetached("x", []SyncProfile{{Name: "x", Sources: []string{"/a"}, Destinations: []string{"/b"}}})
+	if err == nil {
+		t.Fatal("con la finestra occupata non deve partire un job staccato")
+	}
+}

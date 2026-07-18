@@ -130,6 +130,14 @@ func (a *App) startDetached(label string, list []SyncProfile) (string, error) {
 	if jobs.IsHeld(store.RunningLockPath()) {
 		return "", errors.New("un'esecuzione è già in corso")
 	}
+	// The window itself may be busy with something the global lock does not
+	// see from here — a verify, or an in-window run with detach off.
+	a.mu.Lock()
+	windowBusy := a.busy
+	a.mu.Unlock()
+	if windowBusy {
+		return "", errors.New("un'operazione è già in corso in questa finestra")
+	}
 
 	st := jobs.State{
 		JobID:     jobs.NewJobID(),
@@ -177,6 +185,12 @@ func (a *App) startDetached(label string, list []SyncProfile) (string, error) {
 
 // StopJob asks a running job to stop, across process boundaries: the in-memory
 // context of 2.2 cannot reach a supervisor that belongs to no window.
+//
+// The request is a FILE the supervisor polls, not a signal. Signals cannot
+// reach a DETACHED_PROCESS on Windows (no console, no Ctrl event), and on any
+// platform a signal aims at a pid, which is a name that can be recycled. The
+// file is aimed at the job. On Unix a SIGINT is still sent as an accelerator,
+// best effort: if it misses, the poll catches up within its tick.
 func (a *App) StopJob(jobID string) error {
 	store, err := jobStore()
 	if err != nil {
@@ -189,13 +203,48 @@ func (a *App) StopJob(jobID string) error {
 	if !store.IsAlive(jobID) {
 		return errors.New("questa esecuzione non è più in corso")
 	}
-	if st.PID <= 0 {
-		return errors.New("esecuzione senza processo registrato")
+	p, err := store.Paths(jobID)
+	if err != nil {
+		return err
 	}
-	if err := signalStop(st.PID); err != nil {
-		return fmt.Errorf("impossibile interrompere l'esecuzione: %w", err)
+	if err := os.WriteFile(p.Stop, []byte("stop"), 0o644); err != nil {
+		return fmt.Errorf("impossibile chiedere l'interruzione: %w", err)
+	}
+	if st.PID > 0 {
+		_ = signalStop(st.PID) // acceleratore, non il meccanismo
 	}
 	return nil
+}
+
+// ClearJobHistory empties the Attività list: every finished job goes, whatever
+// its outcome — it is the user's history to discard. Live jobs stay.
+func (a *App) ClearJobHistory() (int, error) {
+	store, err := jobStore()
+	if err != nil {
+		return 0, err
+	}
+	n, err := store.ClearFinished()
+	if err != nil {
+		return n, err
+	}
+	a.emitEvent("jobs:changed")
+	return n, nil
+}
+
+// SetHistoryRetention stores how long finished jobs stay in the history before
+// startup cleanup removes them. Hours, clamped to something sane.
+func (a *App) SetHistoryRetention(hours int) error {
+	if hours < 1 {
+		hours = 1
+	}
+	if hours > 24*30 {
+		hours = 24 * 30
+	}
+	a.mu.Lock()
+	a.settings.HistoryRetentionHours = hours
+	s := a.settings
+	a.mu.Unlock()
+	return saveSettings(s)
 }
 
 // JobLogChunk is a slice of a job's log plus where reading got to.
@@ -318,10 +367,20 @@ func indexByte(b []byte, c byte) int {
 	return -1
 }
 
-// CleanupJobs applies the retention policy. Called at startup; the supervisor
-// also calls it when a job ends.
+// cleanupJobs applies the retention policy at startup: first the user's own
+// age limit (default 8 hours, set in Attività), then the safety-net limits.
+// The user limit lives here and not in the supervisor because the supervisor
+// has no business reading the window's preferences.
 func (a *App) cleanupJobs() {
-	if store, err := jobStore(); err == nil {
-		_ = store.Cleanup(time.Now())
+	store, err := jobStore()
+	if err != nil {
+		return
 	}
+	a.mu.Lock()
+	hours := a.settings.HistoryRetentionHours
+	a.mu.Unlock()
+	if hours > 0 {
+		_ = store.PruneOlderThan(time.Now(), time.Duration(hours)*time.Hour)
+	}
+	_ = store.Cleanup(time.Now())
 }

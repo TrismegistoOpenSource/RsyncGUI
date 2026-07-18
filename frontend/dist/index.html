@@ -26,7 +26,7 @@
         </g>
       </svg>
       <span class="brand-name">RsyncGUI</span>
-      <span class="brand-version">2.4</span>
+      <span class="brand-version">2.5</span>
     </div>
     <div class="titlebar-actions" style="--wails-draggable:no-drag">
       <button class="btn ghost" id="btn-verify" title="Controlla una cartella: trova i file che il sistema elenca ma non riesce davvero ad aprire (letto soltanto, non copia né modifica nulla)">
@@ -184,16 +184,55 @@
     <div class="modal jobs-modal">
       <h2>Attività</h2>
       <p class="jobs-hint">
-        Le copie proseguono anche a finestra chiusa. Il log di quelle riuscite viene
-        cancellato subito: resta il riepilogo.
+        Le copie proseguono anche a finestra chiusa. Delle copie riuscite resta la
+        parte finale del log e il riepilogo; di quelle fallite resta tutto.
       </p>
       <label class="switch-row jobs-setting">
         <span>Continua le copie anche se chiudo la finestra</span>
         <input type="checkbox" id="f-detach" /><i></i>
       </label>
+      <div class="jobs-tools">
+        <label class="retention-field" title="All'apertura dell'app, le copie concluse più vecchie di questo limite vengono rimosse dalla cronologia (e i profili tornano senza esito)">
+          <span>Conserva la cronologia per</span>
+          <input type="number" id="f-retention" min="1" max="720" step="1" />
+          <span>ore</span>
+        </label>
+        <button class="btn ghost small" id="btn-clear-history" title="Rimuove subito tutte le copie concluse dalla cronologia; quelle in corso restano">
+          Pulisci cronologia
+        </button>
+        <button class="btn ghost small" id="btn-rsync-info" title="Dove scaricare rsync per il tuo sistema">
+          Installare rsync
+        </button>
+      </div>
       <div class="jobs-list" id="jobs-list"></div>
       <div class="modal-actions">
         <button class="btn ghost" id="jobs-close">Chiudi</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Where to get rsync. Shown on demand, and automatically at startup when
+       no rsync is found in the PATH: this app is a GUI over rsync and does
+       nothing without it. Installing is the user's act, never ours. -->
+  <div class="modal-overlay" id="rsync-modal" hidden>
+    <div class="modal rsync-modal">
+      <h2>rsync non è incluso in quest'app</h2>
+      <div class="rsync-body" id="rsync-body">
+        <p>RsyncGUI è un'interfaccia: il lavoro vero lo fa <strong>rsync</strong>, che deve
+        essere installato sul sistema. Funziona sia con rsync GNU sia con openrsync
+        (preinstallato su macOS recenti).</p>
+        <div class="rsync-links">
+          <button class="btn ghost" data-site="rsync">rsync (GNU) — rsync.samba.org</button>
+          <button class="btn ghost" data-site="openrsync">openrsync — progetto OpenBSD</button>
+          <button class="btn ghost mac-only" data-site="homebrew">macOS — Homebrew</button>
+          <button class="btn ghost win-only" data-site="cwrsync">Windows — cwRsync</button>
+          <button class="btn ghost win-only" data-site="msys2">Windows — MSYS2</button>
+        </div>
+        <p class="rsync-note">Su Linux di solito basta il gestore pacchetti:
+        <code>apt install rsync</code>, <code>dnf install rsync</code> o simili.</p>
+      </div>
+      <div class="modal-actions">
+        <button class="btn primary" id="rsync-close">Ho capito</button>
       </div>
     </div>
   </div>

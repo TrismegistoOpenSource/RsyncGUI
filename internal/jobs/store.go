@@ -259,7 +259,55 @@ func (s *Store) removeJob(jobID string) {
 		_ = os.Remove(p.Log)
 		_ = os.Remove(p.State)
 		_ = os.Remove(p.Lock)
+		_ = os.Remove(p.Stop)
 	}
+}
+
+// PruneOlderThan removes every finished job older than maxAge. It is the
+// user-facing half of retention — "history should not pile up in Attività" —
+// applied when the window opens, with an age the user chooses. The limits in
+// Cleanup stay as the safety net underneath (the supervisor applies them too,
+// and it cannot know the user's preference without reading settings that
+// belong to the window).
+//
+// Live jobs are untouchable here exactly as in Cleanup.
+func (s *Store) PruneOlderThan(now time.Time, maxAge time.Duration) error {
+	states, err := s.List()
+	if err != nil {
+		return err
+	}
+	for _, st := range states {
+		if st.Running() && s.IsAlive(st.JobID) {
+			continue
+		}
+		ref := st.FinishedAt
+		if ref.IsZero() {
+			ref = st.StartedAt
+		}
+		if !ref.IsZero() && now.Sub(ref) > maxAge {
+			s.removeJob(st.JobID)
+		}
+	}
+	return nil
+}
+
+// ClearFinished removes every job that is not currently running, whatever its
+// outcome. It backs the "Pulisci cronologia" button: the user asking for an
+// empty history is entitled to lose the failed logs too — it is their history.
+func (s *Store) ClearFinished() (int, error) {
+	states, err := s.List()
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, st := range states {
+		if st.Running() && s.IsAlive(st.JobID) {
+			continue
+		}
+		s.removeJob(st.JobID)
+		removed++
+	}
+	return removed, nil
 }
 
 func (s *Store) logSize(jobID string) int64 {
@@ -298,10 +346,18 @@ func (s *Store) removeStrayLocks(alive map[string]bool) {
 	}
 	for _, e := range entries {
 		name := e.Name()
-		if name == RunningLockName || !strings.HasSuffix(name, ".lock") {
+		if name == RunningLockName {
 			continue
 		}
-		id := strings.TrimSuffix(name, ".lock")
+		var id string
+		switch {
+		case strings.HasSuffix(name, ".lock"):
+			id = strings.TrimSuffix(name, ".lock")
+		case strings.HasSuffix(name, ".stop"):
+			id = strings.TrimSuffix(name, ".stop")
+		default:
+			continue
+		}
 		if !ValidJobID(id) || alive[id] {
 			continue
 		}

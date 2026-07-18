@@ -472,3 +472,96 @@ func TestFinishLogLeavesShortLogsAlone(t *testing.T) {
 		t.Fatalf("un log corto non va toccato: %q", data)
 	}
 }
+
+// --- ritenzione configurabile e pulizia manuale --------------------------------
+
+// PruneOlderThan is the user-facing retention: finished jobs past the chosen
+// age disappear at startup, and with them the status dots derived from them.
+func TestPruneOlderThanRemovesOldFinishedJobs(t *testing.T) {
+	s := tempStore(t)
+	old := writeFinished(t, s, StatusSuccess, time.Now().Add(-9*time.Hour), 512)
+	oldFailed := writeFinished(t, s, StatusFailed, time.Now().Add(-9*time.Hour), 512)
+	recent := writeFinished(t, s, StatusFailed, time.Now().Add(-1*time.Hour), 512)
+
+	if err := s.PruneOlderThan(time.Now(), 8*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{old, oldFailed} {
+		if _, err := ReadState(s.Dir, id); err == nil {
+			t.Errorf("il job vecchio %s doveva sparire, qualunque fosse l'esito", id[:8])
+		}
+	}
+	if _, err := ReadState(s.Dir, recent); err != nil {
+		t.Error("il job recente doveva restare")
+	}
+}
+
+func TestPruneOlderThanNeverTouchesLiveJobs(t *testing.T) {
+	s := tempStore(t)
+	id := NewJobID()
+	st := newState(id)
+	st.StartedAt = time.Now().Add(-48 * time.Hour) // vecchissimo ma vivo
+	if err := WriteState(s.Dir, st); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := s.Paths(id)
+	lock, err := TryLock(p.Lock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Unlock()
+
+	if err := s.PruneOlderThan(time.Now(), time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadState(s.Dir, id); err != nil {
+		t.Fatal("un job vivo non si tocca, per quanto vecchio")
+	}
+}
+
+// ClearFinished backs the "Pulisci cronologia" button.
+func TestClearFinishedRemovesEverythingButLiveJobs(t *testing.T) {
+	s := tempStore(t)
+	writeFinished(t, s, StatusSuccess, time.Now(), 512)
+	writeFinished(t, s, StatusFailed, time.Now(), 512)
+	live := NewJobID()
+	if err := WriteState(s.Dir, newState(live)); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := s.Paths(live)
+	lock, err := TryLock(p.Lock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Unlock()
+
+	n, err := s.ClearFinished()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("rimossi = %d, attesi 2", n)
+	}
+	list, _ := s.List()
+	if len(list) != 1 || list[0].JobID != live {
+		t.Fatalf("doveva restare solo il job vivo, restano %d", len(list))
+	}
+}
+
+// Stray .stop files with no job left behind them get collected like locks.
+func TestCleanupCollectsStrayStopFiles(t *testing.T) {
+	s := tempStore(t)
+	if err := os.MkdirAll(s.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	orphanStop := filepath.Join(s.Dir, NewJobID()+".stop")
+	if err := os.WriteFile(orphanStop, []byte("stop"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Cleanup(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(orphanStop); err == nil {
+		t.Fatal("il file di stop orfano doveva essere raccolto")
+	}
+}

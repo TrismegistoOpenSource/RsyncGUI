@@ -18,6 +18,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
+	"rsyncgui/internal/jobs"
 )
 
 type SyncOptions struct {
@@ -135,7 +136,8 @@ type AppState struct {
 	// DetachJobs mirrors the setting: copies keep going when the window is
 	// closed. On by default — it is the point of 2.3 — but reversible for
 	// anyone who would rather a job die with the window that started it.
-	DetachJobs bool `json:"detachJobs"`
+	DetachJobs            bool `json:"detachJobs"`
+	HistoryRetentionHours int  `json:"historyRetentionHours"`
 }
 
 type App struct {
@@ -277,11 +279,12 @@ func (a *App) GetState() AppState {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return AppState{
-		Profiles:   append([]SyncProfile{}, a.profiles...),
-		ConfigPath: path,
-		RsyncPath:  rsync,
-		Busy:       a.busy,
-		DetachJobs: a.settings.DetachJobs,
+		Profiles:              append([]SyncProfile{}, a.profiles...),
+		ConfigPath:            path,
+		RsyncPath:             rsync,
+		Busy:                  a.busy,
+		DetachJobs:            a.settings.DetachJobs,
+		HistoryRetentionHours: a.settings.HistoryRetentionHours,
 	}
 }
 
@@ -752,6 +755,44 @@ func destAvailable(path string) bool {
 	return readable(probe)
 }
 
+// acquireRunningGate takes the global one-job-at-a-time lock, translating a
+// busy lock into the user-facing refusal.
+func (a *App) acquireRunningGate() (*jobs.Lock, error) {
+	store, err := jobStore()
+	if err != nil {
+		return nil, err
+	}
+	gate, err := jobs.TryLock(store.RunningLockPath())
+	if err != nil {
+		return nil, errors.New("una copia è in corso: attendi che finisca prima di verificare")
+	}
+	return gate, nil
+}
+
+// OpenRsyncSite opens the download page for one of the known rsync
+// implementations in the system browser. The set is a whitelist on purpose: a
+// bound method that opened arbitrary URLs would hand navigation of the user's
+// browser to whatever runs in the webview.
+//
+// Linking to these sites carries no licensing obligation: nothing is
+// distributed, nothing is linked against — it is a hyperlink. Attribution in
+// THIRD-PARTY-LICENSES stays about what the binary embeds.
+func (a *App) OpenRsyncSite(key string) error {
+	sites := map[string]string{
+		"rsync":     "https://rsync.samba.org/",
+		"openrsync": "https://github.com/kristapsdz/openrsync",
+		"homebrew":  "https://formulae.brew.sh/formula/rsync",
+		"cwrsync":   "https://itefix.net/cwrsync",
+		"msys2":     "https://www.msys2.org/",
+	}
+	url, ok := sites[key]
+	if !ok {
+		return errors.New("sito non riconosciuto")
+	}
+	runtime.BrowserOpenURL(a.ctx, url)
+	return nil
+}
+
 // --- runner ------------------------------------------------------------------
 
 type statusEvent struct {
@@ -781,12 +822,20 @@ func (a *App) enqueueInWindow(list []SyncProfile) error {
 		a.mu.Unlock()
 		return errors.New("un'esecuzione è già in corso")
 	}
+	// Detach may be off in THIS window, but a detached job from a previous
+	// session can still be running: the gate is the only truth they share.
+	gate, gateErr := a.acquireRunningGate()
+	if gateErr != nil {
+		a.mu.Unlock()
+		return gateErr
+	}
 	runCtx, cancel := context.WithCancel(context.Background())
 	a.busy = true
 	a.abort = cancel
 	a.mu.Unlock()
 
 	go func() {
+		defer gate.Unlock()
 		a.emitEvent("run:busy", true)
 		defer func() {
 			cancel() // release the context even on a normal finish
@@ -874,12 +923,24 @@ func (a *App) VerifyFolder(root string) error {
 		a.mu.Unlock()
 		return errors.New("un'operazione è già in corso")
 	}
+	// Verification has always shared the one-at-a-time gate with syncs. Since
+	// 2.3 that gate lives in a file lock owned by detached jobs, which the
+	// in-memory flag knows nothing about: without taking it here, a verify
+	// could run while a detached copy writes — or a copy could start mid
+	// verify from the other side. Holding the lock for the whole walk keeps
+	// the invariant whole across processes.
+	gate, gateErr := a.acquireRunningGate()
+	if gateErr != nil {
+		a.mu.Unlock()
+		return gateErr
+	}
 	runCtx, cancel := context.WithCancel(context.Background())
 	a.busy = true
 	a.abort = cancel
 	a.mu.Unlock()
 
 	go func() {
+		defer gate.Unlock()
 		a.emitEvent("run:busy", true)
 		defer func() {
 			cancel()

@@ -173,6 +173,65 @@ inventare uno zero.
 
 ---
 
+## 5-quater. Lo stop attraversa i processi come FILE, non come segnale (2.5)
+
+**Deciso**: "Interrompi" su un job staccato scrive `<jobid>.stop`; il supervisore lo
+sonda ogni 300 ms. Su Unix parte anche un SIGINT, ma come acceleratore: se manca,
+il file basta.
+
+**Perché**: il meccanismo a segnali era **rotto su Windows senza che nessun test
+potesse dirlo da macOS**. Il supervisore è un `DETACHED_PROCESS`: non ha console, e
+`GenerateConsoleCtrlEvent` — l'unico surrogato di SIGINT — viaggia solo dentro una
+console condivisa. In più un segnale è indirizzato a un *pid*, cioè a un nome
+riciclabile; il file è indirizzato al *job*. Stessa lezione del lock (§3): mai
+fidarsi del pid.
+
+---
+
+## 5-quinquies. Cronologia: ritenzione scelta dall'utente + pulizia manuale (2.5)
+
+**Deciso**: i job conclusi restano in Attività per un numero di ore scelto
+dall'utente (default 8, impostabile in Attività), applicato **all'apertura
+dell'app**; un pulsante "Pulisci cronologia" li rimuove subito. I limiti di
+sicurezza di Cleanup (tetto sulla cartella, ecc.) restano sotto come rete.
+
+**Perché**: dalla 2.3.2 l'esito sui profili deriva dai job su disco, quindi un job
+che non sparisce mai significa un led che non torna mai grigio — segnalato
+dall'utente come difetto. La ritenzione utente vive nella finestra e non nel
+supervisore, perché il supervisore non ha titolo per leggere le preferenze della
+finestra.
+
+---
+
+## 5-sexies. Il gate "una cosa alla volta" copre anche la verifica (2.5)
+
+**Deciso**: "Verifica cartella" prende lo stesso lock globale dei job
+(`running.lock`) per tutta la sua durata; e l'avvio di un job staccato rifiuta se la
+finestra è occupata da una verifica.
+
+**Perché**: la 2.3 aveva spostato l'invariante su file per le copie, ma la verifica
+era rimasta sul flag in memoria: una verifica poteva girare mentre una copia
+staccata scriveva, e viceversa. Buco trovato in audit, non da un sintomo — la
+classe di errore era già nota (§1) e andava cercata ovunque il flag in memoria
+fosse rimasto l'unica guardia.
+
+---
+
+## 5-septies. Link ai siti di rsync: nessun obbligo di licenza (2.5)
+
+**Deciso**: l'app mostra collegamenti per scaricare rsync/openrsync (popup
+all'avvio se mancante, voce in Attività). L'installazione resta un atto
+dell'utente.
+
+**Perché nessun cambiamento alle licenze**: un collegamento ipertestuale non
+distribuisce né incorpora nulla — GPL e ISC pongono obblighi su *distribuzione* e
+*derivazione*, non sul rimandare al sito del produttore. THIRD-PARTY-LICENSES
+continua a citare solo ciò che il binario incorpora. Le URL sono in una whitelist
+nel backend: un metodo esposto che aprisse URL arbitrarie consegnerebbe la
+navigazione del browser a qualunque cosa giri nella webview.
+
+---
+
 ## 6. "Segui", non "Riprendi"
 
 **Deciso**: il pulsante su un job vivo si chiama **Segui** e si limita a riagganciare

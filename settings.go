@@ -19,9 +19,14 @@ type Settings struct {
 	// it is what 2.3 is for. Off restores the 2.2 behaviour, where a job
 	// belongs to the window that started it.
 	DetachJobs bool `json:"detachJobs"`
+	// HistoryRetentionHours is how long finished jobs stay in Attività before
+	// the startup cleanup removes them. The status dots on the profiles are
+	// derived from these jobs, so this is also how long a profile keeps
+	// showing its last outcome.
+	HistoryRetentionHours int `json:"historyRetentionHours"`
 }
 
-func defaultSettings() Settings { return Settings{DetachJobs: true} }
+func defaultSettings() Settings { return Settings{DetachJobs: true, HistoryRetentionHours: 8} }
 
 func settingsPath() (string, error) {
 	dir, err := configDir()
@@ -45,6 +50,11 @@ func loadSettings() Settings {
 	s := defaultSettings()
 	if err := json.Unmarshal(data, &s); err != nil {
 		return defaultSettings()
+	}
+	// A file written before the field existed decodes it to zero, which would
+	// mean "delete everything at once": fall back to the default instead.
+	if s.HistoryRetentionHours <= 0 {
+		s.HistoryRetentionHours = defaultSettings().HistoryRetentionHours
 	}
 	return s
 }

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -85,11 +86,36 @@ func supervise(dir, jobID string) error {
 	st.Status = jobs.StatusRunning
 	_ = jobs.WriteState(dir, st)
 
-	// A stop request from the window arrives as a signal. rsync is then
-	// interrupted the way Ctrl+C would, so it removes the partial file it was
-	// writing instead of leaving it behind.
+	// A stop request from the window arrives as a stop FILE, polled here, with
+	// a Unix signal as a mere accelerator. The file is the mechanism that
+	// works everywhere: on Windows the supervisor is a DETACHED_PROCESS with
+	// no console, and console Ctrl events — the closest thing Windows has to
+	// SIGINT — cannot reach it at all. A file also cannot be delivered to the
+	// wrong process, which a recycled pid could.
 	stopped := make(chan os.Signal, 1)
 	signal.Notify(stopped, os.Interrupt, syscall.SIGTERM)
+	_ = os.Remove(paths.Stop) // stale request from a previous run must not kill this one
+	defer os.Remove(paths.Stop)
+	watchDone := make(chan struct{})
+	defer close(watchDone)
+	go func() {
+		tick := time.NewTicker(300 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-watchDone:
+				return
+			case <-tick.C:
+				if _, err := os.Stat(paths.Stop); err == nil {
+					select {
+					case stopped <- os.Interrupt:
+					default: // già in consegna: non serve insistere
+					}
+					return
+				}
+			}
+		}
+	}()
 
 	res := runProfiles(dir, &st, logw, stopped)
 
@@ -134,35 +160,49 @@ func runProfiles(dir string, st *jobs.State, logw *jobs.LogWriter, stopped <-cha
 	)
 	start := time.Now()
 
-	// Progress reaches the window through the state file, which is rewritten
-	// at most a few times a second: rsync reports on every file, and writing
-	// the state that often would hammer the disk to say almost nothing new.
+	// Progress reaches the window through the state file, rewritten at most a
+	// few times a second: rsync reports on every file, and writing the state
+	// that often would hammer the disk to say almost nothing new.
+	//
+	// The mutex is not decoration. onProgress runs on the goroutine that
+	// exec.Cmd spawns to copy rsync's output (any non-*os.File writer gets
+	// one), while this loop writes CurrentDest and resets the counters between
+	// profiles — same struct, two goroutines. Without the lock that is a data
+	// race on everything WriteState reads.
 	var (
+		stMu      sync.Mutex
 		lastWrite time.Time
 		lastPct   = -2
 	)
+	mutate := func(f func()) {
+		stMu.Lock()
+		f()
+		_ = jobs.WriteState(dir, *st)
+		stMu.Unlock()
+	}
 	onProgress := func(ps ProgressState) {
-		if ps.Percent == lastPct && time.Since(lastWrite) < time.Second {
-			return
-		}
-		if ps.Percent == lastPct && ps.Percent >= 0 {
+		stMu.Lock()
+		if ps.Percent == lastPct && (ps.Percent >= 0 || time.Since(lastWrite) < time.Second) {
+			stMu.Unlock()
 			return // stessa percentuale: niente di nuovo da dire
 		}
 		lastPct, lastWrite = ps.Percent, time.Now()
 		st.Percent, st.FilesDone, st.FilesTotal = ps.Percent, ps.FilesDone, ps.FilesTotal
 		_ = jobs.WriteState(dir, *st)
+		stMu.Unlock()
 	}
 
 	for _, prof := range st.Profiles {
 		if aborted {
 			break
 		}
-		st.CurrentProfile = prof.Name
-		// Each profile is a fresh transfer: carrying the previous one's
-		// percentage over would show a bar that starts at 100%.
-		st.Percent, st.FilesDone, st.FilesTotal = -1, 0, 0
-		lastPct = -2
-		_ = jobs.WriteState(dir, *st)
+		mutate(func() {
+			st.CurrentProfile = prof.Name
+			// Each profile is a fresh transfer: carrying the previous one's
+			// percentage over would show a bar that starts at 100%.
+			st.Percent, st.FilesDone, st.FilesTotal = -1, 0, 0
+			lastPct = -2
+		})
 		fmt.Fprintf(logw, "\n═══ %s ═══\n", prof.Name)
 
 		var opts SyncOptions
@@ -203,8 +243,7 @@ func runProfiles(dir string, st *jobs.State, logw *jobs.LogWriter, stopped <-cha
 				continue
 			}
 
-			st.CurrentDest = dest
-			_ = jobs.WriteState(dir, *st)
+			mutate(func() { st.CurrentDest = dest })
 			if len(prof.Destinations) > 1 {
 				fmt.Fprintf(logw, "→ verso %s\n", dest)
 			}

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Compila RsyncGUI 2.4 per la piattaforma corrente.
+# Compila RsyncGUI 2.5 per la piattaforma corrente.
 #
 # Schema del progetto: sourcecode/ e build/ restano separati, dentro la cartella
 # della versione. Wails però pretende una build/ nella root del progetto: la si

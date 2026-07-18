@@ -6,12 +6,14 @@ const state = {
   profiles: [],
   selection: new Set(),
   statuses: {}, // id -> "running" | "success" | "failed" | "partial"
-  busy: false,
+  windowBusy: false, // verifica o esecuzione in-finestra (eventi run:busy)
+  jobsBusy: false,   // job staccati vivi (derivato dal disco)
   editingId: null,
   sortMode: localStorage.getItem("sortMode") || "tag", // "tag" | "manual"
   logOpen: false,
   jobs: [],
   jobOfProfile: {},
+  eventStatuses: {}, // dagli eventi run:status (solo modalità in-finestra)
 };
 
 const $ = (id) => document.getElementById(id);
@@ -110,14 +112,16 @@ function askConfirm({ title, bodyHtml, confirmLabel, checkboxLabel }) {
 
 // ---- rendering --------------------------------------------------------------
 
+function isBusy() { return state.windowBusy || state.jobsBusy; }
+
 function render() {
   renderChips();
   renderProfiles();
   $("btn-remove").disabled = state.selection.size === 0;
-  $("btn-verify").disabled = state.busy;
+  $("btn-verify").disabled = isBusy();
   const st = $("status-text");
-  st.textContent = state.busy ? "Sincronizzazione in corso…" : "Pronto";
-  st.classList.toggle("busy", state.busy);
+  st.textContent = isBusy() ? "Sincronizzazione in corso…" : "Pronto";
+  st.classList.toggle("busy", isBusy());
   for (const b of $("sort-toggle").querySelectorAll("button")) {
     b.classList.toggle("active", b.dataset.mode === state.sortMode);
   }
@@ -129,11 +133,12 @@ function chip(label, count, title, extraClass, runFn) {
   el.innerHTML = `${escapeHtml(label)} <span class="count">${count}</span>`;
   const play = document.createElement("button");
   play.title = title;
-  play.disabled = state.busy;
+  play.disabled = isBusy();
   play.innerHTML = `<svg viewBox="0 0 12 12"><path d="M3 1.5l7 4.5-7 4.5z"/></svg>`;
   play.addEventListener("click", async () => {
-    openLog();
-    try { await runFn(); } catch (e) { showBanner(String(e), true); }
+    // No openLog here: with detached jobs the output goes to the job file,
+    // and an empty panel that fills only after "Segui" just looks broken.
+    try { await runFn(); refreshJobs(); } catch (e) { showBanner(String(e), true); }
   });
   el.appendChild(play);
   return el;
@@ -261,11 +266,10 @@ function profileCard(p, draggable) {
   const btnRun = document.createElement("button");
   btnRun.className = "btn primary small";
   btnRun.textContent = "Avvia";
-  btnRun.disabled = state.busy;
+  btnRun.disabled = isBusy();
   btnRun.addEventListener("click", async (e) => {
     e.stopPropagation();
-    openLog();
-    try { await api().RunOne(p.id); } catch (err) { showBanner(String(err), true); }
+    try { await api().RunOne(p.id); refreshJobs(); } catch (err) { showBanner(String(err), true); }
   });
 
   actions.append(btnEdit);
@@ -279,7 +283,7 @@ function profileCard(p, draggable) {
     btnRestore.className = "btn ghost small";
     btnRestore.textContent = "Ripristina";
     btnRestore.title = "Copia al contrario: dal backup verso la cartella originale";
-    btnRestore.disabled = state.busy;
+    btnRestore.disabled = isBusy();
     btnRestore.addEventListener("click", (e) => {
       e.stopPropagation();
       onRestore(p);
@@ -377,9 +381,9 @@ async function onRestore(p) {
     if (!second) return;
   }
 
-  openLog();
   try {
     await api().RunRestore(p.id, answer.checked);
+    refreshJobs();
   } catch (e) {
     showBanner(String(e), true);
   }
@@ -795,13 +799,18 @@ function deriveProfileStatuses() {
       jobOf[pid] = j;
     }
   }
+  // Event statuses (detach off) fill the gaps the jobs on disk do not cover;
+  // they must not be clobbered by the poll, which knows nothing about them.
+  for (const [id, st] of Object.entries(state.eventStatuses)) {
+    if (statuses[id] === undefined) statuses[id] = st;
+  }
   state.statuses = statuses;
   state.jobOfProfile = jobOf;
   // Avvia must be disabled while anything is running, as it always was: with
   // one job at a time, a live job means the app is busy.
   const busy = state.jobs.some((j) => j.alive);
-  if (busy !== state.busy) {
-    state.busy = busy;
+  if (busy !== state.jobsBusy) {
+    state.jobsBusy = busy;
     render();
   } else {
     renderProfileDots();
@@ -1017,7 +1026,9 @@ async function pullFollowedLog() {
     // each time would bury the output under its own warning. Once is enough,
     // until we manage to keep up again.
     if (chunk.skipped && !followedSkipping) {
-      appendLog("⋯ il log corre più veloce di quanto si possa mostrare: righe precedenti non mostrate ⋯\n");
+      appendLog(followedOffset === 0
+        ? "⋯ log lungo: mostrate solo le righe finali ⋯\n"
+        : "⋯ il log corre più veloce di quanto si possa mostrare: righe non mostrate ⋯\n");
     }
     followedSkipping = chunk.skipped;
     if (chunk.text) {
@@ -1034,6 +1045,16 @@ async function pullFollowedLog() {
 function openJobsModal() {
   $("jobs-modal").hidden = false;
   renderJobsList();
+}
+
+// openRsyncModal shows where to get rsync, hiding the platform rows that make
+// no sense where we are.
+function openRsyncModal(platform) {
+  const isMac = platform === "darwin";
+  const isWin = platform === "windows";
+  for (const b of document.querySelectorAll("#rsync-modal .mac-only")) b.hidden = !isMac;
+  for (const b of document.querySelectorAll("#rsync-modal .win-only")) b.hidden = !isWin;
+  $("rsync-modal").hidden = false;
 }
 function closeJobsModal() { $("jobs-modal").hidden = true; }
 
@@ -1094,6 +1115,32 @@ function wire() {
   }
 
   $("btn-jobs").addEventListener("click", openJobsModal);
+
+  $("btn-clear-history").addEventListener("click", async () => {
+    try {
+      const n = await api().ClearJobHistory();
+      state.eventStatuses = {};
+      await refreshJobs();
+      render();
+      showBanner(n > 0 ? `Rimosse ${n} copie dalla cronologia.` : "Nessuna copia da rimuovere.", false);
+    } catch (e) { showBanner(String(e), true); }
+  });
+  $("f-retention").addEventListener("change", async (e) => {
+    const hours = Math.max(1, Math.min(720, parseInt(e.target.value, 10) || 8));
+    e.target.value = hours;
+    try { await api().SetHistoryRetention(hours); }
+    catch (err) { showBanner(String(err), true); }
+  });
+  $("btn-rsync-info").addEventListener("click", () => openRsyncModal(state.platform));
+  $("rsync-close").addEventListener("click", () => { $("rsync-modal").hidden = true; });
+  $("rsync-modal").addEventListener("click", (e) => {
+    if (e.target === $("rsync-modal")) $("rsync-modal").hidden = true;
+  });
+  for (const b of document.querySelectorAll("#rsync-modal [data-site]")) {
+    b.addEventListener("click", () => {
+      api().OpenRsyncSite(b.dataset.site).catch((e) => showBanner(String(e), true));
+    });
+  }
   $("jobs-close").addEventListener("click", closeJobsModal);
   $("jobs-modal").addEventListener("click", (e) => {
     if (e.target === $("jobs-modal")) closeJobsModal();
@@ -1151,11 +1198,12 @@ function wire() {
 
   window.runtime.EventsOn("run:log", appendLog);
   window.runtime.EventsOn("run:busy", (busy) => {
-    state.busy = busy;
+    state.windowBusy = busy;
     render();
   });
+  window.runtime.EventsOn("jobs:changed", refreshJobs);
   window.runtime.EventsOn("run:status", (ev) => {
-    state.statuses[ev.id] = ev.status;
+    state.eventStatuses[ev.id] = ev.status;
     render();
   });
 }
@@ -1164,14 +1212,20 @@ async function init() {
   wire();
   const s = await api().GetState();
   setProfiles(s.profiles);
-  state.busy = s.busy;
+  state.windowBusy = s.busy;
   const cp = $("config-path");
   cp.textContent = s.configPath;
   cp.title = s.configPath;
   $("f-detach").checked = s.detachJobs !== false;
+  $("f-retention").value = s.historyRetentionHours || 8;
+  state.platform = navigator.platform.toLowerCase().includes("mac") ? "darwin"
+    : navigator.platform.toLowerCase().includes("win") ? "windows" : "linux";
   startJobsPolling();
   if (!s.rsyncPath) {
+    // Without rsync this app can do nothing at all: a banner is too easy to
+    // miss, so the install guide opens by itself.
     showBanner("rsync non trovato nel PATH: installalo per poter avviare le sincronizzazioni.", true);
+    openRsyncModal(state.platform);
   }
   render();
 }

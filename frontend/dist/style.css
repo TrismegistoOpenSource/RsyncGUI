@@ -627,3 +627,32 @@ input[type="text"]:focus {
 /* sulla card del profilo */
 .card-progress { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
 .card-progress .progress { flex: 1; max-width: 260px; }
+
+/* ---- strumenti della cronologia ---------------------------------------------- */
+.jobs-tools {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-bottom: 14px; padding: 10px 12px;
+  border: 1px solid var(--border); border-radius: 10px;
+  background: rgba(255, 255, 255, 0.02);
+  font-size: 12px; color: var(--text-dim);
+}
+.retention-field { display: flex; align-items: center; gap: 7px; }
+.retention-field input {
+  width: 58px; font: inherit; color: var(--text);
+  background: rgba(255,255,255,0.05);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 4px 8px; text-align: center;
+}
+.jobs-tools .btn { margin-left: auto; }
+.jobs-tools .btn + .btn { margin-left: 0; }
+
+/* ---- installazione rsync ------------------------------------------------------ */
+.rsync-modal { max-width: 520px; }
+.rsync-body p { font-size: 13px; line-height: 1.55; color: var(--text-dim); margin-bottom: 12px; }
+.rsync-body strong { color: var(--text); }
+.rsync-links { display: flex; flex-direction: column; gap: 7px; margin: 14px 0; }
+.rsync-links .btn { justify-content: flex-start; }
+.rsync-note code {
+  font-family: var(--mono); font-size: 11.5px;
+  background: rgba(255,255,255,0.05); padding: 1px 6px; border-radius: 6px;
+}

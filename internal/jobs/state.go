@@ -123,6 +123,12 @@ type Paths struct {
 	State string
 	Log   string
 	Lock  string
+	// Stop is the cross-process stop request: the window creates it, the
+	// supervisor polls for it. A file rather than a signal because signals do
+	// not reach a DETACHED_PROCESS on Windows — it has no console for a Ctrl
+	// event to travel through — while "does this file exist" works identically
+	// everywhere and cannot hit a recycled pid by mistake.
+	Stop string
 }
 
 // PathsFor builds the file names for a job id, or an error if the id is not
@@ -135,6 +141,7 @@ func PathsFor(dir, jobID string) (Paths, error) {
 		State: filepath.Join(dir, jobID+".json"),
 		Log:   filepath.Join(dir, jobID+".log"),
 		Lock:  filepath.Join(dir, jobID+".lock"),
+		Stop:  filepath.Join(dir, jobID+".stop"),
 	}, nil
 }
 
