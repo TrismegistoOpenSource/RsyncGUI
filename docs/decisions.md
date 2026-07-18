@@ -179,6 +179,19 @@ copia.
 **Regola generale che se ne ricava**: mai `textContent +=` in un ciclo, e mai un evento
 per riga verso un webview.
 
+**Corollario scoperto nella 2.3.1**: non conta solo la *frequenza* di ciò che attraversa
+il ponte Go↔webview, ma anche la sua *dimensione*. Il risultato di un metodo esposto
+viene consegnato al webview sul thread dell'interfaccia della piattaforma, quindi un
+blocco grosso non costa soltanto tempo: **blocca la finestra stessa**, che smette di
+rispondere a trascinamenti e clic. Sembra un'interfaccia lenta, ma l'interfaccia è
+ferma — è il ponte a essere occupato.
+
+Concretamente: "Segui" ripartiva da inizio log, quindi agganciare un job che aveva già
+scritto 14 MB significava ritrasmetterli tutti a 512 KB per ciclo, ~28 cicli di ponte
+saturo. Ora si parte dalla coda e si legge al massimo 64 KB per volta: 127 KB totali al
+posto di 14 MB. Seguire un log dal vivo non ha bisogno di volume — nessuno legge mezzo
+megabyte al secondo, serve solo stare vicino alla fine.
+
 ---
 
 ## 10. profiles.json è sacro

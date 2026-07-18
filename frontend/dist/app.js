@@ -741,11 +741,16 @@ function clearLog() {
 // avviata: prosegue a finestra chiusa e va ritrovata alla riapertura. Tutto
 // qui dentro parte quindi dal disco, non da uno stato tenuto in memoria.
 
-const JOBS_POLL_MS = 1000;
+// Polling is only frequent when there is something to watch. Asking the
+// backend once a second while nothing is running costs a directory scan and a
+// lock check per job, for no news.
+const JOBS_POLL_ACTIVE_MS = 1000;
+const JOBS_POLL_IDLE_MS = 5000;
 
 let jobsTimer = null;
-let followedJob = null;   // jobId di cui stiamo mostrando il log
-let followedOffset = 0;   // quanto ne abbiamo già letto
+let followedJob = null;    // jobId di cui stiamo mostrando il log
+let followedOffset = 0;    // quanto ne abbiamo già letto
+let followedSkipping = false; // già avvisato che stiamo saltando
 
 function jobStatusLabel(j) {
   if (j.alive) return "in corso";
@@ -865,7 +870,11 @@ function renderJobsList() {
 // what froze the window before 2.2.1.
 async function followJob(jobId) {
   followedJob = jobId;
+  // 0 means "give me the end of it": a job running unattended can have
+  // written megabytes, and replaying them would stall the window without
+  // showing anything anyone wanted to read.
   followedOffset = 0;
+  followedSkipping = false;
   clearLog();
   closeJobsModal();
   openLog();
@@ -885,10 +894,17 @@ async function pullFollowedLog() {
       followedJob = null;
       return;
     }
+    // A job writing faster than we read makes every poll a skip; saying so
+    // each time would bury the output under its own warning. Once is enough,
+    // until we manage to keep up again.
+    if (chunk.skipped && !followedSkipping) {
+      appendLog("⋯ il log corre più veloce di quanto si possa mostrare: righe precedenti non mostrate ⋯\n");
+    }
+    followedSkipping = chunk.skipped;
     if (chunk.text) {
       appendLog(chunk.text);
-      followedOffset = chunk.offset;
     }
+    followedOffset = chunk.offset;
     const j = state.jobs.find((x) => x.jobId === followedJob);
     if (j && !j.alive && !chunk.text) followedJob = null; // finito e letto tutto
   } catch (_) {
@@ -904,8 +920,19 @@ function closeJobsModal() { $("jobs-modal").hidden = true; }
 
 function startJobsPolling() {
   if (jobsTimer !== null) return;
-  refreshJobs();
-  jobsTimer = setInterval(refreshJobs, JOBS_POLL_MS);
+  scheduleJobsPoll(0);
+}
+
+// A self-rescheduling timeout rather than setInterval: a slow poll must not
+// have the next one queued up behind it.
+function scheduleJobsPoll(delay) {
+  jobsTimer = setTimeout(async () => {
+    await refreshJobs();
+    const busy = followedJob !== null ||
+      state.jobs.some((j) => j.alive) ||
+      !$("jobs-modal").hidden;
+    scheduleJobsPoll(busy ? JOBS_POLL_ACTIVE_MS : JOBS_POLL_IDLE_MS);
+  }, delay);
 }
 
 // ---- wiring -------------------------------------------------------------------

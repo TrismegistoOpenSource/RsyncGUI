@@ -74,6 +74,9 @@ func (a *App) ListJobs() ([]JobView, error) {
 		}
 		v := JobView{
 			JobID: st.JobID, Label: st.Label, Status: st.Status,
+			// Only running states are worth a lock check: it opens a file and
+			// asks the kernel, and doing it for every finished job in the
+			// history would be a syscall storm once a second.
 			Alive:   st.Running() && store.IsAlive(st.JobID),
 			Summary: st.Summary, Issues: st.Issues,
 			CurrentProfile: st.CurrentProfile, CurrentDest: st.CurrentDest,
@@ -179,20 +182,44 @@ func (a *App) StopJob(jobID string) error {
 	return nil
 }
 
-// ReadJobLog returns the tail of a job's log, and the offset reached, so the
-// window can ask for just what is new next time instead of re-reading it all.
-//
-// Reading in chunks matters for the same reason the log is batched: a job that
-// has been running unattended can have written megabytes, and handing them to
-// the webview line by line is what froze the window in 2.2.
+// JobLogChunk is a slice of a job's log plus where reading got to.
 type JobLogChunk struct {
-	Text    string `json:"text"`
-	Offset  int64  `json:"offset"`
-	Missing bool   `json:"missing"`
+	Text   string `json:"text"`
+	Offset int64  `json:"offset"`
+	// Missing means the log is gone, which is the normal end for a job that
+	// went fine: its log is deleted and only the summary remains.
+	Missing bool `json:"missing"`
+	// Skipped means older output was passed over to catch up with the end.
+	Skipped bool `json:"skipped"`
 }
 
-const maxLogChunkBytes = 512 << 10
+// How much of a log crosses to the window at a time.
+//
+// These are small on purpose. Results of a bound method are handed to the
+// webview on the platform's UI thread, so a large payload does not merely cost
+// time — it stalls the window itself, which stops responding to being dragged
+// or clicked. The symptom looks like a slow interface but the interface is
+// idle; it is the bridge that is busy.
+//
+// Following a live log also has no need for volume: nobody reads half a
+// megabyte a second. What matters is being near the end, which is what these
+// limits guarantee.
+const (
+	logChunkBytes = 64 << 10  // per read
+	logTailWindow = 128 << 10 // history shown when first attaching
+	maxCatchUp    = 256 << 10 // further behind than this: jump to the end
+)
 
+// ReadJobLog returns a slice of a job's log starting at from, and the offset
+// reached, so the window can ask only for what is new next time.
+//
+// It deliberately does not replay a log from the beginning. A job left running
+// unattended can have written megabytes, and streaming all of it to catch up
+// would saturate the bridge for as long as it took — the window would be
+// unusable while doing nothing useful, since only the end is being watched.
+// When there is more than maxCatchUp to cover, the reader jumps to the last
+// logTailWindow and says so, and the window shows that output was skipped
+// rather than pretending the log starts there.
 func (a *App) ReadJobLog(jobID string, from int64) (JobLogChunk, error) {
 	store, err := jobStore()
 	if err != nil {
@@ -206,8 +233,7 @@ func (a *App) ReadJobLog(jobID string, from int64) (JobLogChunk, error) {
 	f, err := os.Open(p.Log)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Normal: the log of a job that went fine is deleted on purpose.
-			return JobLogChunk{Missing: true, Offset: 0}, nil
+			return JobLogChunk{Missing: true}, nil
 		}
 		return JobLogChunk{}, err
 	}
@@ -217,21 +243,63 @@ func (a *App) ReadJobLog(jobID string, from int64) (JobLogChunk, error) {
 	if err != nil {
 		return JobLogChunk{}, err
 	}
-	// A compacted log is shorter than it was: start over rather than reading
-	// from an offset that now points into the middle of a line.
-	if from > fi.Size() {
-		from = 0
+	size := fi.Size()
+
+	start, skipped := from, false
+	switch {
+	case from <= 0:
+		// First attach: show recent history, not the whole file.
+		if size > logTailWindow {
+			start, skipped = size-logTailWindow, true
+		} else {
+			start = 0
+		}
+	case from > size:
+		// The log was compacted and is now shorter: an old offset would point
+		// into the middle of a line, or past the end.
+		start, skipped = maxInt64(0, size-logTailWindow), true
+	case size-from > maxCatchUp:
+		// Falling behind a fast writer: skip to the end instead of chasing it.
+		start, skipped = size-logTailWindow, true
 	}
-	if _, err := f.Seek(from, io.SeekStart); err != nil {
+
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
 		return JobLogChunk{}, err
 	}
 
-	buf := make([]byte, maxLogChunkBytes)
+	buf := make([]byte, logChunkBytes)
 	n, err := f.Read(buf)
 	if err != nil && err != io.EOF {
 		return JobLogChunk{}, err
 	}
-	return JobLogChunk{Text: string(buf[:n]), Offset: from + int64(n)}, nil
+	text := buf[:n]
+
+	// After a jump the read almost certainly lands mid-line; start at the next
+	// line break so the log never resumes halfway through a filename.
+	if skipped && start > 0 {
+		if i := indexByte(text, '\n'); i >= 0 {
+			text = text[i+1:]
+			start += int64(i + 1)
+		}
+	}
+
+	return JobLogChunk{Text: string(text), Offset: start + int64(len(text)), Skipped: skipped}, nil
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func indexByte(b []byte, c byte) int {
+	for i := range b {
+		if b[i] == c {
+			return i
+		}
+	}
+	return -1
 }
 
 // CleanupJobs applies the retention policy. Called at startup; the supervisor
