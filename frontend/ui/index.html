@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: MIT -->
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RsyncGUI</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="titlebar" style="--wails-draggable:drag">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 24 24" fill="none">
+        <defs>
+          <linearGradient id="bmBg" x1="0" y1="0" x2="24" y2="24">
+            <stop stop-color="#1b2030"/><stop offset="1" stop-color="#0f1219"/>
+          </linearGradient>
+          <linearGradient id="bmGlyph" x1="3" y1="3" x2="21" y2="21">
+            <stop stop-color="#4fd1ff"/><stop offset="1" stop-color="#5b6cff"/>
+          </linearGradient>
+        </defs>
+        <rect x="0.5" y="0.5" width="23" height="23" rx="6.5" fill="url(#bmBg)" stroke="rgba(255,255,255,0.07)" stroke-width="1"/>
+        <g transform="translate(2.4 2.4) scale(0.8)" fill="none" stroke="url(#bmGlyph)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="23 4 23 10 17 10"/>
+          <polyline points="1 20 1 14 7 14"/>
+          <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+        </g>
+      </svg>
+      <span class="brand-name">RsyncGUI</span>
+      <span class="brand-version">2.5.2</span>
+    </div>
+    <div class="titlebar-actions" style="--wails-draggable:no-drag">
+      <button class="btn ghost" id="btn-verify" title="Controlla una cartella: trova i file che il sistema elenca ma non riesce davvero ad aprire (letto soltanto, non copia né modifica nulla)">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M9 11l1.5 1.5L14 9"/></svg>
+        Verifica
+      </button>
+      <button class="btn ghost" id="btn-import" title="Importa configurazioni da file JSON">
+        <svg viewBox="0 0 24 24"><path d="M12 3v10m0 0l-4-4m4 4l4-4M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
+        Importa
+      </button>
+      <button class="btn ghost" id="btn-export" title="Esporta configurazioni in un file JSON">
+        <svg viewBox="0 0 24 24"><path d="M12 13V3m0 0L8 7m4-4l4 4M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
+        Esporta
+      </button>
+      <button class="btn ghost" id="btn-jobs" title="Copie in corso e recenti">
+        <svg viewBox="0 0 24 24"><path d="M12 8v5l3 2"/><circle cx="12" cy="12" r="9"/></svg>
+        Attività
+        <span class="jobs-badge" id="jobs-badge" hidden></span>
+      </button>
+      <button class="btn ghost" id="btn-log" title="Mostra/nascondi log">
+        <svg viewBox="0 0 24 24"><path d="M4 5h16M4 12h10M4 19h16"/></svg>
+        Log
+      </button>
+    </div>
+  </header>
+
+  <div class="workspace">
+    <main class="content">
+      <div class="toolbar">
+        <div class="toolbar-left">
+          <button class="btn primary" id="btn-add">
+            <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+            Aggiungi
+          </button>
+          <button class="btn danger-ghost" id="btn-remove" disabled>
+            <svg viewBox="0 0 24 24"><path d="M5 12h14"/></svg>
+            Rimuovi
+          </button>
+        </div>
+        <div class="toolbar-right">
+          <div class="sort-toggle" id="sort-toggle">
+            <button data-mode="tag" class="active" title="Raggruppa per tag, in ordine alfabetico">
+              <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+              Per tag
+            </button>
+            <button data-mode="manual" title="Ordina a mano trascinando le righe">
+              <svg viewBox="0 0 24 24"><path d="M8 6h.01M8 12h.01M8 18h.01M16 6h.01M16 12h.01M16 18h.01"/></svg>
+              Manuale
+            </button>
+          </div>
+          <div class="tag-chips" id="tag-chips"></div>
+        </div>
+      </div>
+
+      <div class="banner" id="banner" hidden></div>
+      <div class="running-note" id="running-note" hidden></div>
+
+      <section class="profiles" id="profiles"></section>
+
+      <div class="empty" id="empty" hidden>
+        <svg viewBox="0 0 24 24">
+          <path d="M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+        </svg>
+        <p>Nessuna destinazione configurata.</p>
+        <p class="hint">Premi <strong>Aggiungi</strong> per creare la prima sincronizzazione.</p>
+      </div>
+    </main>
+
+    <aside class="log-panel" id="log-panel" hidden>
+      <div class="log-header">
+        <span>Log</span>
+        <div>
+          <button class="btn ghost small" id="btn-clear-log">Pulisci</button>
+          <button class="btn ghost small" id="btn-close-log">Chiudi</button>
+        </div>
+      </div>
+      <pre class="log-body" id="log-body"></pre>
+    </aside>
+  </div>
+
+  <footer class="statusbar">
+    <span id="status-text">Pronto</span>
+    <span id="config-path" class="config-path" title=""></span>
+  </footer>
+
+  <div class="modal-overlay" id="modal" hidden>
+    <div class="modal">
+      <h2 id="modal-title">Nuova destinazione</h2>
+
+      <label class="field">
+        <span>Nome</span>
+        <input type="text" id="f-name" placeholder="Es. Backup documenti" />
+      </label>
+
+      <div class="field">
+        <span class="field-label">Sorgenti <em>(tutte copiate in ogni destinazione)</em></span>
+        <div id="src-list" class="path-list"></div>
+        <button class="btn ghost small add-path" id="btn-add-src">+ Aggiungi sorgente</button>
+      </div>
+
+      <div class="field">
+        <span class="field-label">Destinazioni <em>(una copia per ciascuna, in sequenza)</em></span>
+        <div id="dest-list" class="path-list"></div>
+        <button class="btn ghost small add-path" id="btn-add-dest">+ Aggiungi destinazione</button>
+
+        <label class="recreate-row" id="recreate-row">
+          <input type="checkbox" id="f-recreate" />
+          <span class="recreate-led"></span>
+          <span class="recreate-main">
+            <span class="recreate-name">Ricrea struttura</span>
+            <em class="recreate-example" id="recreate-example"></em>
+          </span>
+          <span class="recreate-warn">se abilitata non spegnerla</span>
+        </label>
+      </div>
+
+      <div class="field">
+        <span class="field-label">Tag <em>(opzionale — raggruppa più destinazioni per avviarle insieme, una alla volta)</em></span>
+        <div class="tag-input-wrap">
+          <input type="text" id="f-tag" placeholder="Es. backup-serale" autocomplete="off" />
+          <div class="tag-suggestions" id="tag-suggestions" hidden></div>
+        </div>
+      </div>
+
+      <div class="options-grid">
+        <label class="switch-row"><span>Checksum <code>-c</code></span><input type="checkbox" id="f-checksum" /><i></i></label>
+        <label class="switch-row"><span>Elimina extra <code>--delete</code></span><input type="checkbox" id="f-delete" /><i></i></label>
+        <label class="switch-row"><span>Simulazione <code>-n</code></span><input type="checkbox" id="f-dryrun" /><i></i></label>
+        <label class="switch-row"><span>Comprimi <code>-z</code></span><input type="checkbox" id="f-compress" /><i></i></label>
+        <label class="switch-row"><span>Dettagliato <code>-v</code></span><input type="checkbox" id="f-verbose" /><i></i></label>
+        <label class="switch-row" title="Scrive direttamente sul file di destinazione invece di usare un temporaneo da rinominare. Utile su cloud e share di rete, dove la rinomina può fallire. Attenzione: se una copia si interrompe, il file resta parziale.">
+          <span>Scrittura diretta <code>--inplace</code></span><input type="checkbox" id="f-inplace" /><i></i>
+        </label>
+      </div>
+
+      <div class="field">
+        <span class="field-label">Esclusioni</span>
+        <div class="excludes-box">
+          <label class="switch-row" id="sysex-row">
+            <span>File di sistema <em class="sysex-hint">.DS_Store, ._*, Thumbs.db, desktop.ini…</em></span>
+            <input type="checkbox" id="f-sysexcl" /><i></i>
+          </label>
+          <input type="text" id="f-excludes" placeholder="Altre esclusioni, separate da virgola (es. node_modules, *.tmp)" />
+        </div>
+      </div>
+
+      <div class="modal-actions">
+        <button class="btn ghost" id="btn-cancel">Annulla</button>
+        <button class="btn primary" id="btn-save">Salva</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="jobs-modal" hidden>
+    <div class="modal jobs-modal">
+      <h2>Attività</h2>
+      <p class="jobs-hint">
+        Le copie proseguono anche a finestra chiusa. Delle copie riuscite resta la
+        parte finale del log e il riepilogo; di quelle fallite resta tutto.
+      </p>
+      <label class="switch-row jobs-setting">
+        <span>Continua le copie anche se chiudo la finestra</span>
+        <input type="checkbox" id="f-detach" /><i></i>
+      </label>
+      <div class="jobs-tools">
+        <label class="retention-field" title="All'apertura dell'app, le copie concluse più vecchie di questo limite vengono rimosse dalla cronologia (e i profili tornano senza esito)">
+          <span>Conserva la cronologia per</span>
+          <input type="number" id="f-retention" min="1" max="720" step="1" />
+          <span>ore</span>
+        </label>
+        <button class="btn ghost small" id="btn-clear-history" title="Rimuove subito tutte le copie concluse dalla cronologia; quelle in corso restano">
+          Pulisci cronologia
+        </button>
+        <button class="btn ghost small" id="btn-rsync-info" title="Dove scaricare rsync per il tuo sistema">
+          Installare rsync
+        </button>
+      </div>
+      <div class="jobs-list" id="jobs-list"></div>
+      <div class="modal-actions">
+        <button class="btn ghost" id="jobs-close">Chiudi</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Where to get rsync. Shown on demand, and automatically at startup when
+       no rsync is found in the PATH: this app is a GUI over rsync and does
+       nothing without it. Installing is the user's act, never ours. -->
+  <div class="modal-overlay" id="rsync-modal" hidden>
+    <div class="modal rsync-modal">
+      <h2>rsync non è incluso in quest'app</h2>
+      <div class="rsync-body" id="rsync-body">
+        <p>RsyncGUI è un'interfaccia: il lavoro vero lo fa <strong>rsync</strong>, che deve
+        essere installato sul sistema. Funziona sia con rsync GNU sia con openrsync
+        (preinstallato su macOS recenti).</p>
+        <div class="rsync-links">
+          <button class="btn ghost" data-site="rsync">rsync (GNU) — rsync.samba.org</button>
+          <button class="btn ghost" data-site="openrsync">openrsync — progetto OpenBSD</button>
+          <button class="btn ghost mac-only" data-site="homebrew">macOS — Homebrew</button>
+          <button class="btn ghost win-only" data-site="cwrsync">Windows — cwRsync</button>
+          <button class="btn ghost win-only" data-site="msys2">Windows — MSYS2</button>
+        </div>
+        <p class="rsync-note">Su Linux di solito basta il gestore pacchetti:
+        <code>apt install rsync</code>, <code>dnf install rsync</code> o simili.</p>
+      </div>
+      <div class="modal-actions">
+        <button class="btn primary" id="rsync-close">Ho capito</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Reusable confirmation dialog, used wherever an action can destroy data:
+       restoring over the originals, and switching "ricrea struttura" back off. -->
+  <div class="modal-overlay" id="confirm" hidden>
+    <div class="modal confirm-modal">
+      <h2 id="confirm-title"></h2>
+      <div class="confirm-body" id="confirm-body"></div>
+      <label class="switch-row confirm-check" id="confirm-check" hidden>
+        <span id="confirm-check-label"></span>
+        <input type="checkbox" id="confirm-check-input" /><i></i>
+      </label>
+      <div class="modal-actions">
+        <button class="btn ghost" id="confirm-cancel">Annulla</button>
+        <button class="btn danger" id="confirm-ok"></button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

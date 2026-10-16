@@ -1,0 +1,395 @@
+// SPDX-License-Identifier: MIT
+
+package jobs
+
+import (
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+)
+
+// RunningLockName is the one file in here with a fixed name, and it is
+// deliberate: it is what enforces "one job at a time".
+//
+// RsyncGUI has always run a single job at a time — the in-memory busy flag,
+// profiles of a tag running in sequence, even folder verification sharing the
+// same gate. Detaching jobs would quietly break that, because the flag dies
+// with the window while the job does not: closing and reopening during a copy
+// would let a second one start. This lock is that invariant, moved somewhere
+// that outlives the window.
+//
+// Everything else in this package is already per-job and would cope with
+// several live jobs unchanged. If parallel runs are ever wanted, this file is
+// the only thing to rethink — and it must come with a check that two jobs
+// never write to the same destination, which is the real hazard there.
+const RunningLockName = "running.lock"
+
+// Retention. The point is that the folder cannot grow without bound — not that
+// evidence gets destroyed. A job that went fine keeps a short tail of its log,
+// enough to look at what happened, while the bulk of it (thousands of
+// identical "file transferred" lines) goes away. Something that failed keeps
+// its log whole, because that is where the answer is.
+const (
+	// SuccessLogTail is what survives of a successful run's log. Fifty jobs of
+	// history at this size is a few megabytes: nothing, next to the hundreds a
+	// single verbose run can produce.
+	SuccessLogTail = 64 << 10
+
+	FailedLogRetention = 30 * 24 * time.Hour // logs of failed runs
+	StateRetention     = 90 * 24 * time.Hour // the small state files
+	MaxJobsKept        = 50                  // history depth
+	MaxDirBytes        = 200 << 20           // hard ceiling on the whole folder
+)
+
+// Store is the jobs directory.
+type Store struct{ Dir string }
+
+func NewStore(dir string) *Store { return &Store{Dir: dir} }
+
+// RunningLockPath is where the global one-at-a-time lock lives.
+func (s *Store) RunningLockPath() string { return filepath.Join(s.Dir, RunningLockName) }
+
+// Paths returns one job's files, derived from its id.
+func (s *Store) Paths(jobID string) (Paths, error) { return PathsFor(s.Dir, jobID) }
+
+// IsAlive reports whether a job is genuinely still running, by asking the lock
+// rather than the recorded pid. A pid can have been recycled by an unrelated
+// program, which would leave a job showing as "in progress" forever.
+func (s *Store) IsAlive(jobID string) bool {
+	p, err := s.Paths(jobID)
+	if err != nil {
+		return false
+	}
+	return IsHeld(p.Lock)
+}
+
+// StartGrace is how long a job may stay "running" without its supervisor
+// holding the lock, while that supervisor is still starting.
+const StartGrace = 2 * time.Minute
+
+// Live reports whether a job counts as in progress: its supervisor holds the
+// lock, or it has not taken it yet.
+//
+// The window writes the state (status running, pid 0) before launching the
+// supervisor, which takes the lock and writes its own pid only once it is up:
+// the start-up time of a process, which on a slow machine is long enough for
+// the window to look in between. Judged by the lock alone, a job that had just
+// started was declared orphaned and written so to disk ("Una copia si è
+// interrotta in modo anomalo" while it was copying; seen on the Linux VM,
+// 08/10/2026). A pid of 0 means "not started yet"; past StartGrace the
+// supervisor is not coming, and the job is orphaned after all.
+func (s *Store) Live(st State) bool {
+	if !st.Running() {
+		return false
+	}
+	if s.IsAlive(st.JobID) {
+		return true
+	}
+	return st.PID == 0 && time.Since(st.StartedAt) < StartGrace
+}
+
+// List returns every job on disk, newest first, with states that claim to be
+// running but are not reported as orphaned.
+//
+// Orphaned is an honest answer: the supervisor died without writing an
+// outcome, so the job neither succeeded nor failed as far as anyone knows.
+// Silently calling it failed would be a lie, and leaving it "running" would be
+// worse.
+func (s *Store) List() ([]State, error) {
+	entries, err := os.ReadDir(s.Dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var out []State
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		id := strings.TrimSuffix(name, ".json")
+		if !ValidJobID(id) {
+			continue
+		}
+		st, err := ReadState(s.Dir, id)
+		if err != nil {
+			continue // unreadable or half-written: skip rather than fail the list
+		}
+		if st.Running() && !s.Live(st) {
+			st.Status = StatusOrphaned
+			st.Summary = "Interrotto in modo anomalo: l'esito non è noto."
+			_ = WriteState(s.Dir, st)
+		}
+		out = append(out, st)
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].StartedAt.After(out[j].StartedAt) })
+	return out, nil
+}
+
+// FinishLog applies the end-of-job half of the retention policy.
+//
+// A run that went fine (or was deliberately stopped) keeps only the tail of
+// its log: the megabytes of "file transferred" lines are what fills the folder
+// up, but throwing the whole thing away leaves no way to look at a copy that
+// has just finished — which is the first thing anyone wants to do. A run that
+// failed keeps everything: that log is the reason it exists.
+func (s *Store) FinishLog(st State) error {
+	p, err := s.Paths(st.JobID)
+	if err != nil {
+		return err
+	}
+	switch st.Status {
+	case StatusSuccess, StatusAborted:
+		return shrinkToTail(p.Log, SuccessLogTail)
+	}
+	return nil
+}
+
+// shrinkToTail rewrites a file keeping only its last n bytes, starting at a
+// line boundary. A missing file is not an error: the job may never have
+// written anything.
+func shrinkToTail(path string, n int) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if len(data) <= n {
+		return nil
+	}
+
+	tail := data[len(data)-n:]
+	if i := indexOfNewline(tail); i >= 0 && i+1 < len(tail) {
+		tail = tail[i+1:]
+	}
+	var out []byte
+	out = append(out, []byte("⋯ copia riuscita: conservata solo la parte finale del log ⋯\n\n")...)
+	out = append(out, tail...)
+
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o644); err != nil {
+		return err
+	}
+	return replaceFile(tmp, path)
+}
+
+func indexOfNewline(b []byte) int {
+	for i := range b {
+		if b[i] == '\n' {
+			return i
+		}
+	}
+	return -1
+}
+
+// Cleanup enforces the periodic half of the policy. It runs at startup and
+// after every job: a handful of stats over a small directory, cheap enough not
+// to need scheduling.
+//
+// Nothing belonging to a live job is ever touched — that guard comes first in
+// every branch, because deleting the log of a copy in progress would be the
+// silliest possible way to break this feature.
+func (s *Store) Cleanup(now time.Time) error {
+	states, err := s.List()
+	if err != nil {
+		return err
+	}
+
+	alive := map[string]bool{}
+	for _, st := range states {
+		if s.Live(st) {
+			alive[st.JobID] = true
+		}
+	}
+
+	// 1. Logs of failed runs, past their age.
+	for _, st := range states {
+		if alive[st.JobID] {
+			continue
+		}
+		if !st.FinishedAt.IsZero() && now.Sub(st.FinishedAt) > FailedLogRetention {
+			s.removeLog(st.JobID)
+		}
+	}
+
+	// 2. States past their age, log and lock with them.
+	for _, st := range states {
+		if alive[st.JobID] {
+			continue
+		}
+		ref := st.FinishedAt
+		if ref.IsZero() {
+			ref = st.StartedAt
+		}
+		if !ref.IsZero() && now.Sub(ref) > StateRetention {
+			s.removeJob(st.JobID)
+		}
+	}
+
+	// 3. History depth: keep the most recent MaxJobsKept.
+	if remaining := s.finishedNewestFirst(alive); len(remaining) > MaxJobsKept {
+		for _, st := range remaining[MaxJobsKept:] {
+			s.removeJob(st.JobID)
+		}
+	}
+
+	// 4. Hard ceiling on the folder: drop the oldest logs until under budget.
+	// The state files are left alone — they are tiny, and losing the history of
+	// what ran is a worse trade than losing old output.
+	if size, _ := s.dirSize(); size > MaxDirBytes {
+		remaining := s.finishedNewestFirst(alive)
+		for i := len(remaining) - 1; i >= 0 && size > MaxDirBytes; i-- {
+			if n := s.logSize(remaining[i].JobID); n > 0 {
+				s.removeLog(remaining[i].JobID)
+				size -= n
+			}
+		}
+	}
+
+	s.removeStrayLocks(alive)
+	return nil
+}
+
+// finishedNewestFirst lists jobs that are not running, newest first.
+func (s *Store) finishedNewestFirst(alive map[string]bool) []State {
+	states, err := s.List()
+	if err != nil {
+		return nil
+	}
+	var out []State
+	for _, st := range states {
+		if !alive[st.JobID] {
+			out = append(out, st)
+		}
+	}
+	return out // List already sorted newest first
+}
+
+func (s *Store) removeLog(jobID string) {
+	if p, err := s.Paths(jobID); err == nil {
+		// A failure here is not worth reporting: on Windows the file may still
+		// be open by something, and the next cleanup will get it.
+		_ = os.Remove(p.Log)
+	}
+}
+
+func (s *Store) removeJob(jobID string) {
+	if p, err := s.Paths(jobID); err == nil {
+		_ = os.Remove(p.Log)
+		_ = os.Remove(p.State)
+		_ = os.Remove(p.Lock)
+		_ = os.Remove(p.Stop)
+	}
+}
+
+// PruneOlderThan removes every finished job older than maxAge. It is the
+// user-facing half of retention — "history should not pile up in Attività" —
+// applied when the window opens, with an age the user chooses. The limits in
+// Cleanup stay as the safety net underneath (the supervisor applies them too,
+// and it cannot know the user's preference without reading settings that
+// belong to the window).
+//
+// Live jobs are untouchable here exactly as in Cleanup.
+func (s *Store) PruneOlderThan(now time.Time, maxAge time.Duration) error {
+	states, err := s.List()
+	if err != nil {
+		return err
+	}
+	for _, st := range states {
+		if s.Live(st) {
+			continue
+		}
+		ref := st.FinishedAt
+		if ref.IsZero() {
+			ref = st.StartedAt
+		}
+		if !ref.IsZero() && now.Sub(ref) > maxAge {
+			s.removeJob(st.JobID)
+		}
+	}
+	return nil
+}
+
+// ClearFinished removes every job that is not currently running, whatever its
+// outcome. It backs the "Pulisci cronologia" button: the user asking for an
+// empty history is entitled to lose the failed logs too — it is their history.
+func (s *Store) ClearFinished() (int, error) {
+	states, err := s.List()
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, st := range states {
+		if s.Live(st) {
+			continue
+		}
+		s.removeJob(st.JobID)
+		removed++
+	}
+	return removed, nil
+}
+
+func (s *Store) logSize(jobID string) int64 {
+	p, err := s.Paths(jobID)
+	if err != nil {
+		return 0
+	}
+	fi, err := os.Stat(p.Log)
+	if err != nil {
+		return 0
+	}
+	return fi.Size()
+}
+
+func (s *Store) dirSize() (int64, error) {
+	entries, err := os.ReadDir(s.Dir)
+	if err != nil {
+		return 0, err
+	}
+	var total int64
+	for _, e := range entries {
+		if fi, err := e.Info(); err == nil {
+			total += fi.Size()
+		}
+	}
+	return total, nil
+}
+
+// removeStrayLocks deletes lock files with no state file left beside them,
+// which is what a deleted job leaves behind. Live jobs are skipped, and so is
+// the global lock.
+func (s *Store) removeStrayLocks(alive map[string]bool) {
+	entries, err := os.ReadDir(s.Dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if name == RunningLockName {
+			continue
+		}
+		var id string
+		switch {
+		case strings.HasSuffix(name, ".lock"):
+			id = strings.TrimSuffix(name, ".lock")
+		case strings.HasSuffix(name, ".stop"):
+			id = strings.TrimSuffix(name, ".stop")
+		default:
+			continue
+		}
+		if !ValidJobID(id) || alive[id] {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(s.Dir, id+".json")); os.IsNotExist(err) {
+			_ = os.Remove(filepath.Join(s.Dir, name))
+		}
+	}
+}

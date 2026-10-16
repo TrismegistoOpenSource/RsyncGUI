@@ -1,0 +1,1357 @@
+// SPDX-License-Identifier: MIT
+
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/wailsapp/wails/v2/pkg/runtime"
+	"rsyncgui/internal/jobs"
+)
+
+type SyncOptions struct {
+	Checksum bool `json:"checksum"`
+	Delete   bool `json:"delete"`
+	DryRun   bool `json:"dryRun"`
+	Compress bool `json:"compress"`
+	Verbose  bool `json:"verbose"`
+	Inplace  bool `json:"inplace"`
+	// RecreateStructure copies the source folder itself into the destination
+	// instead of pouring its contents in: /A → /B becomes /B/A. It is rsync's
+	// trailing-slash rule (see rsyncArgs), exposed as a switch.
+	//
+	// Turning it off again on a profile that ran with it on is destructive when
+	// Delete is also set: the previously written /B/A becomes "extra" and rsync
+	// removes it. That is why the UI warns before letting it be switched off.
+	RecreateStructure bool `json:"recreateStructure"`
+	// ExcludeSystemFiles defaults to true, including for profiles saved before
+	// this option existed — see UnmarshalJSON.
+	ExcludeSystemFiles bool     `json:"excludeSystemFiles"`
+	CustomExcludes     []string `json:"customExcludes,omitempty"`
+}
+
+// UnmarshalJSON turns ExcludeSystemFiles on when the key is absent: a profile
+// written by an older version must still get the exclusions by default, and a
+// plain bool would silently decode to false.
+func (o *SyncOptions) UnmarshalJSON(data []byte) error {
+	type alias SyncOptions
+	o.ExcludeSystemFiles = true
+	return json.Unmarshal(data, (*alias)(o))
+}
+
+// systemFileExcludes are files the OS generates on its own: Finder metadata,
+// thumbnail caches, trash and indexing folders. They hold no user data, get
+// rewritten constantly, and are exactly what tends to fail on network/cloud
+// destinations.
+var systemFileExcludes = []string{
+	// macOS
+	".DS_Store",
+	"._*", // AppleDouble: resource forks / xattrs on non-native filesystems
+	".Spotlight-V100",
+	".DocumentRevisions-V100",
+	".TemporaryItems",
+	".Trashes",
+	".fseventsd",
+	".VolumeIcon.icns",
+	".apdisk",
+	".localized",
+	// Windows
+	"Thumbs.db",
+	"ehthumbs.db",
+	"desktop.ini",
+	"$RECYCLE.BIN",
+	// Linux
+	".Trash-*",
+	".directory",
+}
+
+// junkFiles are the system files that are pure per-folder caches: when Delete
+// is on they are hidden from the transfer instead of excluded, so the copies
+// already in the destination get deleted too.
+//
+// With a plain --exclude rsync leaves them alone on the receiving side, and a
+// folder removed from the source then survives forever in the destination with
+// just a .DS_Store inside ("not empty, cannot delete"). --delete-excluded is
+// not the fix: it would also wipe the volume's own .Spotlight-V100, .fseventsd
+// and .Trashes when the destination is a disk's root (the SD profiles are), the
+// user's custom excludes, and in openrsync it overrides the "-r" rules that
+// protect accented names (see normalization.go) — verified.
+//
+// ._* stays excluded: on FAT/exFAT and SMB those files hold the extended
+// attributes of the destination's own files, and the system removes them
+// together with the file they belong to.
+var junkFiles = map[string]bool{
+	".DS_Store":   true,
+	"Thumbs.db":   true,
+	"ehthumbs.db": true,
+	"desktop.ini": true,
+}
+
+// SyncProfile: one entity = N sources synced to M destinations
+// (rsync natively accepts many sources but only one destination per run,
+// so execution loops over destinations sequentially).
+type SyncProfile struct {
+	ID           string      `json:"id"`
+	Name         string      `json:"name"`
+	Sources      []string    `json:"sources"`
+	Destinations []string    `json:"destinations"`
+	Tag          string      `json:"tag"`
+	Options      SyncOptions `json:"options"`
+}
+
+// UnmarshalJSON also accepts the 1.x schema (single "source"/"destination"),
+// so existing profiles.json files load unchanged.
+func (p *SyncProfile) UnmarshalJSON(data []byte) error {
+	type alias SyncProfile
+	aux := struct {
+		*alias
+		LegacySource string `json:"source"`
+		LegacyDest   string `json:"destination"`
+	}{alias: (*alias)(p)}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if len(p.Sources) == 0 && aux.LegacySource != "" {
+		p.Sources = []string{aux.LegacySource}
+	}
+	if len(p.Destinations) == 0 && aux.LegacyDest != "" {
+		p.Destinations = []string{aux.LegacyDest}
+	}
+	return nil
+}
+
+// MarshalJSON keeps writing the legacy keys (first source/destination) so the
+// 1.x app can still read the first pair of each profile.
+func (p SyncProfile) MarshalJSON() ([]byte, error) {
+	type alias SyncProfile
+	aux := struct {
+		alias
+		LegacySource string `json:"source"`
+		LegacyDest   string `json:"destination"`
+	}{alias: alias(p)}
+	if len(p.Sources) > 0 {
+		aux.LegacySource = p.Sources[0]
+	}
+	if len(p.Destinations) > 0 {
+		aux.LegacyDest = p.Destinations[0]
+	}
+	return json.Marshal(aux)
+}
+
+type AppState struct {
+	Profiles   []SyncProfile `json:"profiles"`
+	ConfigPath string        `json:"configPath"`
+	RsyncPath  string        `json:"rsyncPath"`
+	Busy       bool          `json:"busy"`
+	// DetachJobs mirrors the setting: copies keep going when the window is
+	// closed. On by default — it is the point of 2.3 — but reversible for
+	// anyone who would rather a job die with the window that started it.
+	DetachJobs            bool `json:"detachJobs"`
+	HistoryRetentionHours int  `json:"historyRetentionHours"`
+}
+
+type App struct {
+	ctx      context.Context
+	mu       sync.Mutex
+	profiles []SyncProfile
+	busy     bool
+	logOpen  bool
+	// abort cancels the running queue and kills the rsync process in flight.
+	abort    context.CancelFunc
+	settings Settings
+
+	// Log lines are accumulated here and sent to the frontend in batches by
+	// logPump — see emitLog.
+	logMu  sync.Mutex
+	logBuf strings.Builder
+}
+
+// How the log reaches the window. rsync -v on a large transfer emits thousands
+// of lines per second (measured: ~3200/s on a local disk); one event per line
+// saturates the webview's main thread and the whole GUI stops repainting.
+// Lines are therefore coalesced and flushed a few times per second, which is
+// far faster than anyone can read and costs one event instead of hundreds.
+const (
+	logFlushInterval = 100 * time.Millisecond
+	// Force a flush before the buffer grows past this, so a burst between two
+	// ticks can't hold an unbounded amount of text in memory.
+	maxPendingLogBytes = 256 * 1024
+)
+
+// logPanelWidth is how much the window grows to the right when the log panel
+// is shown, kept in sync with .log-panel width in style.css.
+const logPanelWidth = 400
+
+func NewApp() *App {
+	return &App{profiles: []SyncProfile{}, settings: defaultSettings()}
+}
+
+func (a *App) startup(ctx context.Context) {
+	a.ctx = ctx
+	a.load()
+	a.mu.Lock()
+	a.settings = loadSettings()
+	a.mu.Unlock()
+	// Old logs and finished jobs are cleared out on the way in: a handful of
+	// stats over a small directory, cheaper than any scheduling would be.
+	a.cleanupJobs()
+	go a.logPump(ctx)
+}
+
+// --- persistence -----------------------------------------------------------
+
+// configDir resolves per OS via os.UserConfigDir:
+// macOS ~/Library/Application Support, Linux ~/.config, Windows %AppData%.
+// RSYNCGUI_CONFIG_DIR overrides it, so tests never write to the real profiles.
+func configDir() (string, error) {
+	dir := os.Getenv("RSYNCGUI_CONFIG_DIR")
+	if dir == "" {
+		base, err := os.UserConfigDir()
+		if err != nil {
+			return "", err
+		}
+		dir = filepath.Join(base, "RsyncGUI")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+func profilesPath() (string, error) {
+	dir, err := configDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "profiles.json"), nil
+}
+
+func (a *App) load() {
+	path, err := profilesPath()
+	if err != nil {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var decoded []SyncProfile
+	if json.Unmarshal(data, &decoded) == nil {
+		a.mu.Lock()
+		a.profiles = decoded
+		a.mu.Unlock()
+	}
+}
+
+// backupPath holds the previous contents of profiles.json: one copy, rewritten
+// before every save, so a bad save (or a mistake) is always one `cp` from undo.
+func backupPath() (string, error) {
+	path, err := profilesPath()
+	if err != nil {
+		return "", err
+	}
+	return path + ".bak", nil
+}
+
+func (a *App) save() error {
+	path, err := profilesPath()
+	if err != nil {
+		return err
+	}
+
+	// Copy the current file aside before it gets replaced. A missing or
+	// unreadable file just means there is nothing worth backing up yet, and a
+	// failed backup must never block the user from saving their work.
+	if prev, readErr := os.ReadFile(path); readErr == nil && len(prev) > 0 {
+		if bak, bakErr := backupPath(); bakErr == nil {
+			_ = os.WriteFile(bak, prev, 0o644)
+		}
+	}
+
+	a.mu.Lock()
+	data, err := json.MarshalIndent(a.profiles, "", "  ")
+	a.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// --- bound methods (frontend API) -------------------------------------------
+
+func (a *App) GetState() AppState {
+	path, _ := profilesPath()
+	rsync, _ := exec.LookPath("rsync")
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return AppState{
+		Profiles:              append([]SyncProfile{}, a.profiles...),
+		ConfigPath:            path,
+		RsyncPath:             rsync,
+		Busy:                  a.busy,
+		DetachJobs:            a.settings.DetachJobs,
+		HistoryRetentionHours: a.settings.HistoryRetentionHours,
+	}
+}
+
+func cleanList(list []string) []string {
+	var out []string
+	for _, s := range list {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func (a *App) SaveProfile(p SyncProfile) ([]SyncProfile, error) {
+	p.Name = strings.TrimSpace(p.Name)
+	p.Tag = strings.TrimSpace(p.Tag)
+	p.Sources = cleanList(p.Sources)
+	p.Destinations = cleanList(p.Destinations)
+	p.Options.CustomExcludes = cleanList(p.Options.CustomExcludes)
+	if len(p.Sources) == 0 || len(p.Destinations) == 0 {
+		return nil, errors.New("serve almeno una sorgente e una destinazione")
+	}
+	if p.Name == "" {
+		p.Name = filepath.Base(strings.TrimRight(p.Sources[0], "/\\"))
+	}
+
+	a.mu.Lock()
+	if p.ID == "" {
+		p.ID = strings.ToUpper(uuid.NewString())
+		a.profiles = append(a.profiles, p)
+	} else {
+		found := false
+		for i := range a.profiles {
+			if a.profiles[i].ID == p.ID {
+				a.profiles[i] = p
+				found = true
+				break
+			}
+		}
+		if !found {
+			a.profiles = append(a.profiles, p)
+		}
+	}
+	result := append([]SyncProfile{}, a.profiles...)
+	a.mu.Unlock()
+
+	if err := a.save(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (a *App) DeleteProfiles(ids []string) ([]SyncProfile, error) {
+	idSet := map[string]bool{}
+	for _, id := range ids {
+		idSet[id] = true
+	}
+	a.mu.Lock()
+	kept := a.profiles[:0]
+	for _, p := range a.profiles {
+		if !idSet[p.ID] {
+			kept = append(kept, p)
+		}
+	}
+	a.profiles = append([]SyncProfile{}, kept...)
+	result := append([]SyncProfile{}, a.profiles...)
+	a.mu.Unlock()
+
+	if err := a.save(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// ReorderProfiles persists the manual order: profiles are rewritten to match
+// the given id sequence. Ids not present are ignored; any stored profile not
+// listed is kept at the end (defensive against a stale frontend list).
+func (a *App) ReorderProfiles(ids []string) ([]SyncProfile, error) {
+	a.mu.Lock()
+	byID := map[string]SyncProfile{}
+	for _, p := range a.profiles {
+		byID[p.ID] = p
+	}
+	var ordered []SyncProfile
+	for _, id := range ids {
+		if p, ok := byID[id]; ok {
+			ordered = append(ordered, p)
+			delete(byID, id)
+		}
+	}
+	for _, p := range a.profiles {
+		if _, ok := byID[p.ID]; ok {
+			ordered = append(ordered, p)
+		}
+	}
+	a.profiles = ordered
+	result := append([]SyncProfile{}, a.profiles...)
+	a.mu.Unlock()
+
+	if err := a.save(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// SetLogVisible grows or shrinks the window by logPanelWidth so the log opens
+// as a side extension of the window rather than covering the main UI. The
+// logOpen guard keeps repeated show/hide calls from stacking the resize.
+func (a *App) SetLogVisible(visible bool) {
+	if visible == a.logOpen {
+		return
+	}
+	w, h := runtime.WindowGetSize(a.ctx)
+	if visible {
+		runtime.WindowSetSize(a.ctx, w+logPanelWidth, h)
+	} else {
+		runtime.WindowSetSize(a.ctx, w-logPanelWidth, h)
+	}
+	a.logOpen = visible
+}
+
+func (a *App) ChooseDirectory(title string) (string, error) {
+	return runtime.OpenDirectoryDialog(a.ctx, runtime.OpenDialogOptions{
+		Title:                title,
+		CanCreateDirectories: true,
+	})
+}
+
+// ExportProfiles writes the current list to a user-chosen JSON file,
+// starting from the app's own config folder so the location is obvious.
+func (a *App) ExportProfiles() (string, error) {
+	dir, _ := configDir()
+	path, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+		Title:            "Esporta configurazioni",
+		DefaultDirectory: dir,
+		DefaultFilename:  "RsyncGUI-profili.json",
+		Filters:          []runtime.FileFilter{{DisplayName: "JSON", Pattern: "*.json"}},
+	})
+	if err != nil || path == "" {
+		return "", err
+	}
+	a.mu.Lock()
+	data, err := json.MarshalIndent(a.profiles, "", "  ")
+	a.mu.Unlock()
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// ImportProfiles merges profiles from a chosen file: same id overwrites,
+// new ids are appended — importing an old export never duplicates entries.
+func (a *App) ImportProfiles() (int, error) {
+	dir, _ := configDir()
+	path, err := runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
+		Title:            "Importa configurazioni",
+		DefaultDirectory: dir,
+		Filters:          []runtime.FileFilter{{DisplayName: "JSON", Pattern: "*.json"}},
+	})
+	if err != nil || path == "" {
+		return -1, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return -1, err
+	}
+	var imported []SyncProfile
+	if err := json.Unmarshal(data, &imported); err != nil {
+		return -1, fmt.Errorf("file non valido: %w", err)
+	}
+
+	a.mu.Lock()
+	for _, p := range imported {
+		replaced := false
+		for i := range a.profiles {
+			if a.profiles[i].ID == p.ID {
+				a.profiles[i] = p
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			a.profiles = append(a.profiles, p)
+		}
+	}
+	a.mu.Unlock()
+
+	if err := a.save(); err != nil {
+		return -1, err
+	}
+	return len(imported), nil
+}
+
+func (a *App) RunOne(id string) error {
+	a.mu.Lock()
+	var target *SyncProfile
+	for i := range a.profiles {
+		if a.profiles[i].ID == id {
+			p := a.profiles[i]
+			target = &p
+			break
+		}
+	}
+	a.mu.Unlock()
+	if target == nil {
+		return errors.New("destinazione non trovata")
+	}
+	return a.enqueue([]SyncProfile{*target})
+}
+
+func (a *App) RunTag(tag string) error {
+	a.mu.Lock()
+	var list []SyncProfile
+	for _, p := range a.profiles {
+		if p.Tag == tag {
+			list = append(list, p)
+		}
+	}
+	a.mu.Unlock()
+	if len(list) == 0 {
+		return errors.New("nessuna destinazione con questo tag")
+	}
+	return a.enqueue(list)
+}
+
+// RunUntagged runs every profile that has no tag, in sequence like a tag group.
+func (a *App) RunUntagged() error {
+	a.mu.Lock()
+	var list []SyncProfile
+	for _, p := range a.profiles {
+		if p.Tag == "" {
+			list = append(list, p)
+		}
+	}
+	a.mu.Unlock()
+	if len(list) == 0 {
+		return errors.New("nessuna destinazione senza tag")
+	}
+	return a.enqueue(list)
+}
+
+// --- restore -------------------------------------------------------------------
+
+// RestorePlan describes what a restore would do, so the UI can spell it out
+// before anything is written. Allowed is false when the reverse copy would be
+// ambiguous, and Reason then says why.
+type RestorePlan struct {
+	Allowed          bool   `json:"allowed"`
+	Reason           string `json:"reason"`
+	ProfileName      string `json:"profileName"`
+	From             string `json:"from"`
+	To               string `json:"to"`
+	ProfileHasDelete bool   `json:"profileHasDelete"`
+}
+
+// pathBase returns the last element of a path, for local and rsync remote
+// specs (host:/path) alike. filepath.Base is not enough: on Windows it splits
+// on "\" and would mangle a remote path, and the caller may hand us a value
+// with a trailing slash.
+//
+// A local Windows path is the exception: it uses "\" and starts with a drive
+// whose colon is not a host separator ("C:\Users\me\A" came out as
+// "\Users\me\A", and a RecreateStructure restore looked for the backup there).
+func pathBase(p string) string {
+	if isWindowsLocalPath(p) {
+		return filepath.Base(p)
+	}
+	s := strings.TrimRight(p, "/")
+	if i := strings.LastIndexAny(s, "/"); i >= 0 {
+		return s[i+1:]
+	}
+	if i := strings.LastIndex(s, ":"); i >= 0 {
+		return s[i+1:]
+	}
+	return s
+}
+
+// pathJoin appends a child name to a path without assuming the local
+// separator, so remote specs keep working.
+func pathJoin(base, child string) string {
+	if isWindowsLocalPath(base) {
+		return filepath.Join(base, child)
+	}
+	return strings.TrimRight(base, "/") + "/" + child
+}
+
+// restorePlan works out the reverse of a profile's copy.
+//
+// Restore is only offered on profiles with exactly one source and one
+// destination. With several sources rsync merges their contents into the
+// destination, and nothing in the result records which file came from where,
+// so there is no way to send them back that isn't a guess — and a wrong guess
+// overwrites the user's originals.
+//
+// The backup to read from depends on how the copy was written: with
+// RecreateStructure the data sits in <dest>/<source name>, otherwise directly
+// in <dest>. Either way the restore writes into the original source path, and
+// always in "contents" mode (trailing slash) so the folder itself is not
+// nested one level deeper on the way back.
+func restorePlan(p SyncProfile) RestorePlan {
+	plan := RestorePlan{ProfileName: p.Name, ProfileHasDelete: p.Options.Delete}
+
+	if len(p.Sources) != 1 || len(p.Destinations) != 1 {
+		plan.Reason = "Il ripristino è disponibile solo sui profili con una sola sorgente e una sola destinazione: " +
+			"con più percorsi le copie si mescolano nella destinazione e non è più possibile sapere da dove veniva ogni file."
+		return plan
+	}
+
+	source, dest := p.Sources[0], p.Destinations[0]
+	if source == "" || dest == "" {
+		plan.Reason = "Il profilo non ha una sorgente e una destinazione valide."
+		return plan
+	}
+
+	backup := dest
+	if p.Options.RecreateStructure {
+		backup = pathJoin(dest, pathBase(source))
+	}
+
+	plan.Allowed = true
+	plan.From = backup
+	plan.To = source
+	return plan
+}
+
+// RestorePlanFor is the frontend's way to ask what a restore would do.
+func (a *App) RestorePlanFor(id string) (RestorePlan, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, p := range a.profiles {
+		if p.ID == id {
+			return restorePlan(p), nil
+		}
+	}
+	return RestorePlan{}, errors.New("destinazione non trovata")
+}
+
+// RunRestore copies the backup back over the original: destination → source.
+//
+// withDelete is asked for every single time in the UI rather than taken from
+// the profile, because it means something far more dangerous in this direction:
+// forward it prunes the backup, backward it deletes from the user's own data
+// everything the backup does not have — every file created since the last copy.
+func (a *App) RunRestore(id string, withDelete bool) error {
+	a.mu.Lock()
+	var target *SyncProfile
+	for i := range a.profiles {
+		if a.profiles[i].ID == id {
+			p := a.profiles[i]
+			target = &p
+			break
+		}
+	}
+	a.mu.Unlock()
+	if target == nil {
+		return errors.New("destinazione non trovata")
+	}
+
+	plan := restorePlan(*target)
+	if !plan.Allowed {
+		return errors.New(plan.Reason)
+	}
+	if !sourceAvailable(plan.From) {
+		return fmt.Errorf("il backup da cui ripristinare non è raggiungibile: %s", plan.From)
+	}
+	// Restoring from an empty backup is almost certainly a mistake (wrong
+	// volume, or a destination that was never written). Harmless without
+	// --delete, but with it the original folder gets emptied — refuse instead.
+	if withDelete {
+		empty, err := dirLooksEmpty(plan.From)
+		if err == nil && empty {
+			return fmt.Errorf("il backup %s risulta vuoto: un ripristino con eliminazione svuoterebbe %s", plan.From, plan.To)
+		}
+	}
+
+	// The reverse run is built here rather than reusing the profile's own
+	// options: paths are already in contents mode, so RecreateStructure must
+	// be off, and Delete follows what the user just confirmed.
+	opts := target.Options
+	opts.RecreateStructure = false
+	opts.Delete = withDelete
+
+	restoreProfile := SyncProfile{
+		ID:           target.ID,
+		Name:         target.Name + " (ripristino)",
+		Sources:      []string{strings.TrimRight(plan.From, "/") + "/"},
+		Destinations: []string{plan.To},
+		Tag:          target.Tag,
+		Options:      opts,
+	}
+	return a.enqueue([]SyncProfile{restoreProfile})
+}
+
+// dirLooksEmpty reports whether a local directory holds no entries at all.
+// Remote paths can't be inspected from here, so they're never called empty.
+func dirLooksEmpty(dir string) (bool, error) {
+	if isRemote(dir) {
+		return false, nil
+	}
+	f, err := os.Open(dir)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	names, err := f.Readdirnames(1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false, err
+	}
+	return len(names) == 0, nil
+}
+
+// --- path availability --------------------------------------------------------
+
+// isRemote reports whether a path is an rsync remote spec (host:path or
+// rsync://): those can't be checked locally, so they're always attempted.
+func isRemote(path string) bool {
+	if strings.HasPrefix(path, "rsync://") {
+		return true
+	}
+	idx := strings.Index(path, ":")
+	if idx <= 0 {
+		return false
+	}
+	head := path[:idx]
+	if strings.ContainsAny(head, "/\\") {
+		return false
+	}
+	// single letter before ":" is a Windows drive (C:\...), not a host
+	return len(head) > 1
+}
+
+// readable reports whether a directory can actually be read, not merely
+// stat'ed. A dead cloud or network mount (pCloud losing its daemon, an SMB
+// share dropping) keeps stat'ing fine while every real I/O fails with
+// ENXIO/ENOTCONN — so stat alone would wave through exactly the destinations
+// this check exists to skip.
+func readable(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	if _, err := f.Readdirnames(1); err != nil && err != io.EOF {
+		return false
+	}
+	return true
+}
+
+func sourceAvailable(path string) bool {
+	if isRemote(path) {
+		return true
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	if fi.IsDir() {
+		return readable(path)
+	}
+	return true
+}
+
+// destAvailable: the destination itself may not exist yet (rsync creates it),
+// so the check falls back to its parent — which must be genuinely readable,
+// not just present. Catches unmounted volumes, dead mounts and typos.
+func destAvailable(path string) bool {
+	if isRemote(path) {
+		return true
+	}
+	probe := path
+	if _, err := os.Stat(path); err != nil {
+		probe = filepath.Dir(strings.TrimRight(path, "/\\"))
+	}
+	return readable(probe)
+}
+
+// acquireRunningGate takes the global one-job-at-a-time lock, translating a
+// busy lock into the user-facing refusal.
+func (a *App) acquireRunningGate() (*jobs.Lock, error) {
+	store, err := jobStore()
+	if err != nil {
+		return nil, err
+	}
+	gate, err := jobs.TryLock(store.RunningLockPath())
+	if err != nil {
+		return nil, errors.New("una copia è in corso: attendi che finisca prima di verificare")
+	}
+	return gate, nil
+}
+
+// OpenRsyncSite opens the download page for one of the known rsync
+// implementations in the system browser. The set is a whitelist on purpose: a
+// bound method that opened arbitrary URLs would hand navigation of the user's
+// browser to whatever runs in the webview.
+//
+// Linking to these sites carries no licensing obligation: nothing is
+// distributed, nothing is linked against — it is a hyperlink. Attribution in
+// THIRD-PARTY-LICENSES stays about what the binary embeds.
+func (a *App) OpenRsyncSite(key string) error {
+	sites := map[string]string{
+		"rsync":     "https://rsync.samba.org/",
+		"openrsync": "https://github.com/kristapsdz/openrsync",
+		"homebrew":  "https://formulae.brew.sh/formula/rsync",
+		"cwrsync":   "https://itefix.net/cwrsync",
+		"msys2":     "https://www.msys2.org/",
+	}
+	url, ok := sites[key]
+	if !ok {
+		return errors.New("sito non riconosciuto")
+	}
+	runtime.BrowserOpenURL(a.ctx, url)
+	return nil
+}
+
+// --- runner ------------------------------------------------------------------
+
+type statusEvent struct {
+	ID      string `json:"id"`
+	Status  string `json:"status"`
+	Message string `json:"message"`
+}
+
+// enqueue runs the given profiles strictly one after another, never
+// concurrently. Unavailable paths are skipped without stopping the queue;
+// every problem is repeated in a summary at the end of the log.
+// enqueue starts a run. With detach on (the default) the work is handed to a
+// supervisor process that outlives this window; the in-window runner below is
+// kept for when the setting is off, and is unchanged from 2.2.
+func (a *App) enqueue(list []SyncProfile) error {
+	if a.detachEnabled() {
+		label := runLabel(list)
+		_, err := a.startDetached(label, list)
+		return err
+	}
+	return a.enqueueInWindow(list)
+}
+
+func (a *App) enqueueInWindow(list []SyncProfile) error {
+	a.mu.Lock()
+	if a.busy {
+		a.mu.Unlock()
+		return errors.New("un'esecuzione è già in corso")
+	}
+	// Detach may be off in THIS window, but a detached job from a previous
+	// session can still be running: the gate is the only truth they share.
+	gate, gateErr := a.acquireRunningGate()
+	if gateErr != nil {
+		a.mu.Unlock()
+		return gateErr
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	a.busy = true
+	a.abort = cancel
+	a.mu.Unlock()
+
+	go func() {
+		defer gate.Unlock()
+		a.emitEvent("run:busy", true)
+		defer func() {
+			cancel() // release the context even on a normal finish
+			a.mu.Lock()
+			a.busy = false
+			a.abort = nil
+			a.mu.Unlock()
+			a.flushLog() // the closing summary must not wait for the next tick
+			a.emitEvent("run:busy", false)
+		}()
+
+		var allIssues []string
+		for _, p := range list {
+			// Stop between profiles too: aborting must not start the next one.
+			if runCtx.Err() != nil {
+				a.emitEvent("run:status", statusEvent{ID: p.ID, Status: "aborted"})
+				continue
+			}
+
+			a.emitEvent("run:status", statusEvent{ID: p.ID, Status: "running"})
+			a.emitLog(fmt.Sprintf("\n═══ %s ═══\n", p.Name))
+
+			completed, issues := a.runProfile(runCtx, p)
+
+			if runCtx.Err() != nil {
+				a.emitEvent("run:status", statusEvent{ID: p.ID, Status: "aborted"})
+				continue
+			}
+
+			allIssues = append(allIssues, issues...)
+			detail := strings.Join(issues, "; ")
+			var status string
+			switch {
+			case len(issues) == 0:
+				status = "success"
+			case completed > 0:
+				status = "partial"
+			default:
+				status = "failed"
+			}
+			a.flushLog() // keep the log ahead of the status dot it explains
+			a.emitEvent("run:status", statusEvent{ID: p.ID, Status: status, Message: detail})
+			a.notifyForStatus(status, p.Name, detail)
+		}
+
+		switch {
+		case runCtx.Err() != nil:
+			a.emitLog("\n⛔ Interrotto. Le copie non ancora eseguite sono state annullate.\n")
+		case len(allIssues) > 0:
+			a.emitLog("\n─── Riepilogo problemi ───\n")
+			for _, issue := range allIssues {
+				a.emitLog("• " + issue + "\n")
+			}
+		default:
+			a.emitLog("\nTutto completato senza problemi.\n")
+		}
+	}()
+	return nil
+}
+
+// Abort stops the queue and kills the rsync currently running.
+func (a *App) Abort() error {
+	a.mu.Lock()
+	cancel := a.abort
+	busy := a.busy
+	a.mu.Unlock()
+
+	if !busy || cancel == nil {
+		return errors.New("nessuna esecuzione in corso")
+	}
+	a.emitLog("\n⛔ Interruzione richiesta…\n")
+	cancel()
+	return nil
+}
+
+// VerifyFolder walks a folder and reports every file that the filesystem
+// lists (readdir/stat) but that can't actually be opened and read — the
+// class of bug found on a QNAP SMB share where the server answers "this file
+// exists" to a listing but refuses to serve its content. Read-only: nothing
+// is copied, deleted or modified, so it's safe to point at anything, and it
+// runs in the background like a sync (shares the same busy/log/Abort).
+func (a *App) VerifyFolder(root string) error {
+	a.mu.Lock()
+	if a.busy {
+		a.mu.Unlock()
+		return errors.New("un'operazione è già in corso")
+	}
+	// Verification has always shared the one-at-a-time gate with syncs. Since
+	// 2.3 that gate lives in a file lock owned by detached jobs, which the
+	// in-memory flag knows nothing about: without taking it here, a verify
+	// could run while a detached copy writes — or a copy could start mid
+	// verify from the other side. Holding the lock for the whole walk keeps
+	// the invariant whole across processes.
+	gate, gateErr := a.acquireRunningGate()
+	if gateErr != nil {
+		a.mu.Unlock()
+		return gateErr
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	a.busy = true
+	a.abort = cancel
+	a.mu.Unlock()
+
+	go func() {
+		defer gate.Unlock()
+		a.emitEvent("run:busy", true)
+		defer func() {
+			cancel()
+			a.mu.Lock()
+			a.busy = false
+			a.abort = nil
+			a.mu.Unlock()
+			a.flushLog()
+			a.emitEvent("run:busy", false)
+		}()
+
+		a.emitLog(fmt.Sprintf("\n═══ Verifica: %s ═══\n", root))
+		scanned, broken := a.verifyWalk(runCtx, root)
+
+		switch {
+		case runCtx.Err() != nil:
+			a.emitLog(fmt.Sprintf("\n⛔ Verifica interrotta dopo %d file controllati.\n", scanned))
+		case len(broken) == 0:
+			a.emitLog(fmt.Sprintf("\n✓ %d file controllati, tutti apribili.\n", scanned))
+		default:
+			a.emitLog(fmt.Sprintf("\n─── %d di %d file non apribili (elencati sopra) ───\n", len(broken), scanned))
+		}
+	}()
+	return nil
+}
+
+// verifyWalk does the actual traversal: open + a short read per file, enough
+// to catch "listed but refuses to serve content" without reading whole
+// multi-GB files just to prove they're reachable.
+func (a *App) verifyWalk(runCtx context.Context, root string) (scanned int, broken []string) {
+	lastReport := time.Now()
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if runCtx.Err() != nil {
+			return filepath.SkipAll
+		}
+		if err != nil {
+			msg := fmt.Sprintf("%s (%v)", path, err)
+			broken = append(broken, msg)
+			a.emitLog("✗ " + msg + "\n")
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+
+		scanned++
+		if time.Since(lastReport) > 2*time.Second {
+			a.emitLog(fmt.Sprintf("  …%d file controllati\n", scanned))
+			lastReport = time.Now()
+		}
+
+		f, openErr := os.Open(path)
+		if openErr != nil {
+			msg := fmt.Sprintf("%s (%v)", path, openErr)
+			broken = append(broken, msg)
+			a.emitLog("✗ " + msg + "\n")
+			return nil
+		}
+		defer f.Close()
+		buf := make([]byte, 64)
+		if _, readErr := f.Read(buf); readErr != nil && readErr != io.EOF {
+			msg := fmt.Sprintf("%s (%v)", path, readErr)
+			broken = append(broken, msg)
+			a.emitLog("✗ " + msg + "\n")
+		}
+		return nil
+	})
+	return scanned, broken
+}
+
+// emitLog queues one piece of log output. It does not reach the window
+// immediately: logPump ships whatever has accumulated every logFlushInterval.
+// Callers can keep calling it per line without thinking about the cost.
+func (a *App) emitLog(text string) {
+	a.logMu.Lock()
+	a.logBuf.WriteString(text)
+	tooBig := a.logBuf.Len() >= maxPendingLogBytes
+	a.logMu.Unlock()
+
+	if tooBig {
+		a.flushLog()
+	}
+}
+
+// flushLog sends everything queued so far, if anything. Safe to call from any
+// goroutine and when there is no window: emitEvent drops the event, and the
+// buffer is emptied either way so it cannot grow without bound under test.
+func (a *App) flushLog() {
+	a.logMu.Lock()
+	if a.logBuf.Len() == 0 {
+		a.logMu.Unlock()
+		return
+	}
+	text := a.logBuf.String()
+	a.logBuf.Reset()
+	a.logMu.Unlock()
+
+	a.emitEvent("run:log", text)
+}
+
+// logPump flushes the queued log on a timer for as long as the app is running.
+// It costs one idle goroutine ticking a few times a second, which is nothing
+// next to what it saves during a transfer.
+func (a *App) logPump(ctx context.Context) {
+	ticker := time.NewTicker(logFlushInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			a.flushLog() // don't lose the last lines on the way out
+			return
+		case <-ticker.C:
+			a.flushLog()
+		}
+	}
+}
+
+// emitEvent is the single door to the frontend event bus. Wails aborts the
+// process when EventsEmit gets a context other than the one from the lifecycle
+// hooks, so every emission goes through here: with no window attached — before
+// startup, or under test, where the runner drives the queue directly — the
+// event simply has nowhere to go and is dropped.
+func (a *App) emitEvent(name string, data ...interface{}) {
+	if a.ctx == nil {
+		return
+	}
+	runtime.EventsEmit(a.ctx, name, data...)
+}
+
+// runProfile syncs all available sources into each available destination,
+// one rsync run per destination. Unavailable paths are skipped and reported;
+// the rest of the profile (and the queue) keeps going.
+func (a *App) runProfile(runCtx context.Context, p SyncProfile) (completed int, issues []string) {
+	var srcs []string
+	for _, s := range p.Sources {
+		if sourceAvailable(s) {
+			srcs = append(srcs, s)
+		} else {
+			msg := fmt.Sprintf("%s: sorgente non disponibile, saltata: %s", p.Name, s)
+			issues = append(issues, msg)
+			a.emitLog("⚠ " + msg + "\n")
+		}
+	}
+	if len(srcs) == 0 {
+		msg := fmt.Sprintf("%s: nessuna sorgente disponibile, nulla da copiare", p.Name)
+		issues = append(issues, msg)
+		a.emitLog("⚠ " + msg + "\n")
+		return 0, issues
+	}
+
+	for _, dest := range p.Destinations {
+		// A profile with many destinations must stop at the current one.
+		if runCtx.Err() != nil {
+			return completed, issues
+		}
+		if !destAvailable(dest) {
+			msg := fmt.Sprintf("%s: destinazione non disponibile, saltata: %s", p.Name, dest)
+			issues = append(issues, msg)
+			a.emitLog("⚠ " + msg + "\n")
+			continue
+		}
+		if len(p.Destinations) > 1 {
+			a.emitLog(fmt.Sprintf("→ verso %s\n", dest))
+		}
+
+		exitCode, err := a.execRsync(runCtx, p.Options, srcs, dest)
+		if runCtx.Err() != nil {
+			// killed by Abort: whatever came back is moot, not a real failure
+			return completed, issues
+		}
+
+		switch {
+		case err != nil:
+			msg := fmt.Sprintf("%s → %s: %s", p.Name, dest, err.Error())
+			issues = append(issues, msg)
+			a.emitLog("✗ " + msg + "\n")
+		case exitCode == 0:
+			completed++
+			a.emitLog("Completato.\n")
+		case isPartialTransferExitCode(exitCode):
+			// The bulk of the data did arrive; rsync itself skipped the rest
+			// and kept going (typical of a network/cloud mount driver that
+			// lists a file but then refuses to open it). Counts as completed,
+			// not failed — the log above has the exact file(s) it skipped.
+			completed++
+			msg := fmt.Sprintf("%s → %s: completata con uno o più file non trasferibili (dettagli nel log sopra)", p.Name, dest)
+			issues = append(issues, msg)
+			a.emitLog("⚠ " + msg + "\n")
+		default:
+			msg := fmt.Sprintf("%s → %s: rsync terminato con errore (exit %d)", p.Name, dest, exitCode)
+			issues = append(issues, msg)
+			a.emitLog("✗ " + msg + "\n")
+		}
+	}
+	return completed, issues
+}
+
+// interruptOnCancel makes a cancelled context stop the command the same way
+// Ctrl+C does, with SIGINT instead of the default SIGKILL: rsync traps SIGINT
+// and removes the partial temp file it was writing, while SIGKILL would leave
+// it behind in the destination. WaitDelay is the escape hatch if it ignores the
+// signal and hangs.
+// newRsyncCmd builds every rsync invocation, the window's and the
+// supervisor's alike. On Windows rsync is a console program started by
+// processes without a console: hideConsole keeps it from opening a black
+// window for the whole copy.
+func newRsyncCmd(ctx context.Context, bin string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, bin, args...)
+	hideConsole(cmd)
+	return cmd
+}
+
+func interruptOnCancel(cmd *exec.Cmd) {
+	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
+	cmd.WaitDelay = 5 * time.Second
+}
+
+// rsyncArgs builds the command line for one destination.
+//
+// -a (archive) is always on, so permissions, ownership, timestamps and symlinks
+// are preserved wherever the destination filesystem can actually hold them
+// (SMB shares, cloud mounts and volumes mounted `noowners` cannot: they
+// synthesise their own — rsync still asks, they just don't keep it).
+//
+// protectRules is the filter file from writeTwinProtectRules, "" for none.
+func rsyncArgs(opts SyncOptions, sources []string, dest, protectRules string) []string {
+	args := []string{"-a"}
+	if opts.Checksum {
+		args = append(args, "-c")
+	}
+	if opts.Delete {
+		args = append(args, "--delete")
+	}
+	if opts.DryRun {
+		args = append(args, "-n")
+	}
+	if opts.Compress {
+		args = append(args, "-z")
+	}
+	if opts.Verbose {
+		args = append(args, "-v")
+	}
+	// Writes straight into the destination file instead of the temp-file +
+	// rename dance, which is the step that fails on cloud/network mounts.
+	if opts.Inplace {
+		args = append(args, "--inplace")
+	}
+	// --progress is what makes a progress bar possible at all: rsync is the
+	// only one that knows how many files it will really touch, since it
+	// decides for itself what to skip as already up to date. Its output is
+	// parsed and kept out of the log (see progress.go), so this costs nothing
+	// but the numbers.
+	//
+	// --info=progress2 would be tidier but does not exist everywhere: macOS
+	// ships openrsync, which rejects it. --progress works on both families.
+	args = append(args, "--progress")
+	if opts.ExcludeSystemFiles {
+		for _, pattern := range systemFileExcludes {
+			if opts.Delete && junkFiles[pattern] {
+				args = append(args, "--filter=H "+pattern)
+			} else {
+				args = append(args, "--exclude="+pattern)
+			}
+		}
+	}
+	if protectRules != "" {
+		args = append(args, "--filter=merge "+rsyncPath(protectRules))
+	}
+	for _, pattern := range opts.CustomExcludes {
+		if pattern = strings.TrimSpace(pattern); pattern != "" {
+			args = append(args, "--exclude="+pattern)
+		}
+	}
+
+	// rsync decides between "copy this folder" and "copy what's inside it" from
+	// a single trailing slash: `rsync /A /B` writes /B/A, `rsync /A/ /B` pours
+	// A's contents straight into /B. RecreateStructure picks which one.
+	//
+	// Default (off) keeps the contents behaviour of 1.x. On, the slash is
+	// stripped instead of added, so a path stored with one still recreates the
+	// folder; "/" itself is left alone, as it has no folder name to recreate.
+	//
+	// The slash rule works on the path as rsync will see it (on Windows
+	// "C:\A\" becomes "/proc/cygdrive/c/A/"), the stat on the local one.
+	for _, local := range sources {
+		src := rsyncPath(local)
+		if opts.RecreateStructure {
+			if trimmed := strings.TrimRight(src, "/"); trimmed != "" {
+				src = trimmed
+			}
+		} else if fi, statErr := os.Stat(local); statErr == nil && fi.IsDir() && !strings.HasSuffix(src, "/") {
+			src += "/"
+		}
+		args = append(args, src)
+	}
+	return append(args, rsyncPath(dest))
+}
+
+// isPartialTransferExitCode reports rsync exit codes that mean the run
+// completed but skipped one or more individual files, as opposed to the
+// whole run failing. 23: partial transfer due to error — the case a flaky
+// network/cloud mount driver produces when it can list a file but then
+// refuses to open it (observed with QNAP SMB shares and dead cloud mounts).
+// 24: partial transfer due to vanished source files. Both are documented
+// rsync exit codes, stable across GNU rsync and openrsync alike, which is
+// why the classification lives here instead of parsing implementation-
+// specific error text.
+func isPartialTransferExitCode(code int) bool {
+	return code == 23 || code == 24
+}
+
+// execRsync runs one rsync invocation and reports how it ended: exitCode is
+// rsync's own exit status (0 = full success; see isPartialTransferExitCode
+// for the "some files skipped" case), and err is set only when the process
+// itself never produced one (missing binary, failed to start).
+func (a *App) execRsync(runCtx context.Context, opts SyncOptions, sources []string, dest string) (exitCode int, err error) {
+	rsyncBin, err := exec.LookPath("rsync")
+	if err != nil {
+		return -1, errors.New("rsync non trovato nel PATH: installalo per usare questa app")
+	}
+
+	protectRules, cleanup, err := writeTwinProtectRules(opts, sources)
+	if err != nil {
+		return -1, fmt.Errorf("preparazione delle protezioni per i nomi accentati: %v", err)
+	}
+	defer cleanup()
+
+	cmd := newRsyncCmd(runCtx, rsyncBin, rsyncArgs(opts, sources, dest, protectRules)...)
+	interruptOnCancel(cmd)
+	pr, pw := io.Pipe()
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		scanner := bufio.NewScanner(pr)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			a.emitLog(scanner.Text() + "\n")
+		}
+	}()
+
+	if err := cmd.Start(); err != nil {
+		pw.Close()
+		wg.Wait()
+		return -1, err
+	}
+	runErr := cmd.Wait()
+	pw.Close()
+	wg.Wait()
+
+	if runErr == nil {
+		return 0, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) {
+		return exitErr.ExitCode(), nil
+	}
+	// Killed by something other than a normal exit (e.g. a signal our own
+	// Abort didn't send) — no usable exit code, treat as a hard failure.
+	return -1, fmt.Errorf("rsync terminato con errore: %v", runErr)
+}
+
+// Tags is kept for API completeness (the frontend derives tags client-side).
+func (a *App) Tags() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	seen := map[string]bool{}
+	var tags []string
+	for _, p := range a.profiles {
+		if p.Tag != "" && !seen[p.Tag] {
+			seen[p.Tag] = true
+			tags = append(tags, p.Tag)
+		}
+	}
+	sort.Strings(tags)
+	return tags
+}
