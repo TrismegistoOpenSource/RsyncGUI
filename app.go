@@ -173,6 +173,8 @@ type App struct {
 	// abort cancels the running queue and kills the rsync process in flight.
 	abort    context.CancelFunc
 	settings Settings
+	// outcome of the startup self-check (integrity.go)
+	integrity integrityState
 
 	// Log lines are accumulated here and sent to the frontend in batches by
 	// logPump — see emitLog.
@@ -288,11 +290,7 @@ func (a *App) save() error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return writeFileAtomic(path, data, 0o644)
 }
 
 // --- bound methods (frontend API) -------------------------------------------
@@ -507,20 +505,23 @@ func (a *App) ImportProfiles() (int, error) {
 }
 
 func (a *App) RunOne(id string) error {
-	a.mu.Lock()
-	var target *SyncProfile
-	for i := range a.profiles {
-		if a.profiles[i].ID == id {
-			p := a.profiles[i]
-			target = &p
-			break
-		}
-	}
-	a.mu.Unlock()
-	if target == nil {
+	target, ok := a.profileByID(id)
+	if !ok {
 		return errors.New("destinazione non trovata")
 	}
-	return a.enqueue([]SyncProfile{*target})
+	return a.enqueue([]SyncProfile{target})
+}
+
+// profileByID returns a copy of the profile with that id.
+func (a *App) profileByID(id string) (SyncProfile, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, p := range a.profiles {
+		if p.ID == id {
+			return p, true
+		}
+	}
+	return SyncProfile{}, false
 }
 
 func (a *App) RunTag(tag string) error {
@@ -657,21 +658,12 @@ func (a *App) RestorePlanFor(id string) (RestorePlan, error) {
 // forward it prunes the backup, backward it deletes from the user's own data
 // everything the backup does not have — every file created since the last copy.
 func (a *App) RunRestore(id string, withDelete bool) error {
-	a.mu.Lock()
-	var target *SyncProfile
-	for i := range a.profiles {
-		if a.profiles[i].ID == id {
-			p := a.profiles[i]
-			target = &p
-			break
-		}
-	}
-	a.mu.Unlock()
-	if target == nil {
+	target, ok := a.profileByID(id)
+	if !ok {
 		return errors.New("destinazione non trovata")
 	}
 
-	plan := restorePlan(*target)
+	plan := restorePlan(target)
 	if !plan.Allowed {
 		return errors.New(plan.Reason)
 	}
@@ -850,36 +842,54 @@ func (a *App) enqueue(list []SyncProfile) error {
 	return a.enqueueInWindow(list)
 }
 
-func (a *App) enqueueInWindow(list []SyncProfile) error {
+// beginRun claims the window's one-job-at-a-time slot and the cross-process
+// gate, and returns the context that Abort cancels plus the function that
+// releases everything. The caller starts a goroutine that does the work and
+// defers done() in it.
+//
+// Detach may be off in THIS window, but a detached job from a previous
+// session can still be running: the gate is the only truth they share. Since
+// 2.3 that gate lives in a file lock owned by detached jobs, which the
+// in-memory flag knows nothing about: without taking it, a verify could run
+// while a detached copy writes — or a copy could start mid-verify from the
+// other side. Holding the lock for the whole run keeps the invariant whole
+// across processes.
+func (a *App) beginRun(busyMsg string) (context.Context, func(), error) {
 	a.mu.Lock()
 	if a.busy {
 		a.mu.Unlock()
-		return errors.New("un'esecuzione è già in corso")
+		return nil, nil, errors.New(busyMsg)
 	}
-	// Detach may be off in THIS window, but a detached job from a previous
-	// session can still be running: the gate is the only truth they share.
 	gate, gateErr := a.acquireRunningGate()
 	if gateErr != nil {
 		a.mu.Unlock()
-		return gateErr
+		return nil, nil, gateErr
 	}
 	runCtx, cancel := context.WithCancel(context.Background())
 	a.busy = true
 	a.abort = cancel
 	a.mu.Unlock()
+	return runCtx, func() {
+		cancel() // release the context even on a normal finish
+		a.mu.Lock()
+		a.busy = false
+		a.abort = nil
+		a.mu.Unlock()
+		a.flushLog() // the closing summary must not wait for the next tick
+		a.emitEvent("run:busy", false)
+		gate.Unlock()
+	}, nil
+}
+
+func (a *App) enqueueInWindow(list []SyncProfile) error {
+	runCtx, done, err := a.beginRun("un'esecuzione è già in corso")
+	if err != nil {
+		return err
+	}
 
 	go func() {
-		defer gate.Unlock()
 		a.emitEvent("run:busy", true)
-		defer func() {
-			cancel() // release the context even on a normal finish
-			a.mu.Lock()
-			a.busy = false
-			a.abort = nil
-			a.mu.Unlock()
-			a.flushLog() // the closing summary must not wait for the next tick
-			a.emitEvent("run:busy", false)
-		}()
+		defer done()
 
 		var allIssues []string
 		for _, p := range list {
@@ -952,39 +962,15 @@ func (a *App) Abort() error {
 // is copied, deleted or modified, so it's safe to point at anything, and it
 // runs in the background like a sync (shares the same busy/log/Abort).
 func (a *App) VerifyFolder(root string) error {
-	a.mu.Lock()
-	if a.busy {
-		a.mu.Unlock()
-		return errors.New("un'operazione è già in corso")
+	// Verification shares the one-at-a-time gate with syncs (see beginRun).
+	runCtx, done, err := a.beginRun("un'operazione è già in corso")
+	if err != nil {
+		return err
 	}
-	// Verification has always shared the one-at-a-time gate with syncs. Since
-	// 2.3 that gate lives in a file lock owned by detached jobs, which the
-	// in-memory flag knows nothing about: without taking it here, a verify
-	// could run while a detached copy writes — or a copy could start mid
-	// verify from the other side. Holding the lock for the whole walk keeps
-	// the invariant whole across processes.
-	gate, gateErr := a.acquireRunningGate()
-	if gateErr != nil {
-		a.mu.Unlock()
-		return gateErr
-	}
-	runCtx, cancel := context.WithCancel(context.Background())
-	a.busy = true
-	a.abort = cancel
-	a.mu.Unlock()
 
 	go func() {
-		defer gate.Unlock()
 		a.emitEvent("run:busy", true)
-		defer func() {
-			cancel()
-			a.mu.Lock()
-			a.busy = false
-			a.abort = nil
-			a.mu.Unlock()
-			a.flushLog()
-			a.emitEvent("run:busy", false)
-		}()
+		defer done()
 
 		a.emitLog(fmt.Sprintf("\n═══ Verifica: %s ═══\n", root))
 		scanned, broken := a.verifyWalk(runCtx, root)
@@ -1188,7 +1174,7 @@ func newRsyncCmd(ctx context.Context, bin string, args ...string) *exec.Cmd {
 }
 
 func interruptOnCancel(cmd *exec.Cmd) {
-	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
+	cmd.Cancel = func() error { return interruptProcess(cmd.Process) }
 	cmd.WaitDelay = 5 * time.Second
 }
 

@@ -5,6 +5,7 @@
 package main
 
 import (
+	"os"
 	"os/exec"
 	"syscall"
 )
@@ -28,4 +29,9 @@ func hideConsole(*exec.Cmd) {}
 // gets to remove its partial temporary file.
 func signalStop(pid int) error {
 	return syscall.Kill(pid, syscall.SIGINT)
+}
+
+// interruptProcess asks a child to stop with SIGINT, as Ctrl+C would.
+func interruptProcess(p *os.Process) error {
+	return p.Signal(os.Interrupt)
 }

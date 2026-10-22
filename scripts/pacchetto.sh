@@ -9,16 +9,27 @@
 #   macOS    ../build/RsyncGUI-AppleSilicon.zip, RsyncGUI-Intel.zip
 #   Linux    ../build/RsyncGUI-Linux-x86_64.AppImage
 #   Windows  ../build/RsyncGUI-Windows.zip (cartella con exe e LICENZE)
+#
+# Per l'autoverifica (internal/autoverifica) ogni sistema consegna anche
+# ../build/INTEGRITA-<sistema>.txt: lo SHA-256 di ogni file che l'utente riceve,
+# eseguibile compreso. Va fra gli asset della release, quindi lo elenca il
+# SHA256SUMS.txt firmato. Sul pacchetto Linux e Windows lo stesso elenco sta anche
+# dentro (INTEGRITA.txt); su macOS l'elenco dentro l'app lo scrive build.sh prima
+# della firma del sistema e non contiene l'eseguibile.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 B=../build
 
 pacchetto_macos() {
+  local nome sistema
   for nome in RsyncGUI-AppleSilicon RsyncGUI-Intel; do
     rm -f "$B/$nome.zip"
     # --keepParent obbligatorio: senza, lo zip contiene Contents/ e non l'app
     ditto -c -k --sequesterRsrc --keepParent "$B/$nome.app" "$B/$nome.zip"
     echo "→ $B/$nome.zip"
+    # elenco completo, dell'app già firmata (eseguibile e _CodeSignature compresi)
+    case "$nome" in *AppleSilicon) sistema=macos-arm64 ;; *) sistema=macos-amd64 ;; esac
+    bash scripts/integrita-pacchetto.sh genera "$B/$nome.app" "$B/INTEGRITA-$sistema.txt"
   done
 }
 
@@ -52,6 +63,9 @@ Categories=Utility;
 StartupWMClass=RsyncGUI
 DESKTOP
   ln -s usr/bin/RsyncGUI "$A/AppRun"
+  # elenco di integrità (internal/autoverifica): dentro la AppDir e fra gli asset della release
+  bash scripts/integrita-pacchetto.sh genera "$A" "$A/INTEGRITA.txt"
+  cp "$A/INTEGRITA.txt" "$B/INTEGRITA-linux-amd64.txt"
   # --appimage-extract-and-run: i runner non hanno FUSE.
   rm -f "$B/RsyncGUI-Linux-x86_64.AppImage"
   ARCH=x86_64 "$tool" --appimage-extract-and-run "$A" "$B/RsyncGUI-Linux-x86_64.AppImage"
@@ -63,6 +77,9 @@ pacchetto_windows() {
   # Git Bash non ha zip: il tar di Windows (bsdtar) sceglie il formato
   # dall'estensione (PROBLEMI-NOTI.md §28).
   rm -f "$B/RsyncGUI-Windows.zip"
+  # elenco di integrità (internal/autoverifica): dentro la cartella e fra gli asset della release
+  bash scripts/integrita-pacchetto.sh genera "$B/RsyncGUI-Windows" "$B/RsyncGUI-Windows/INTEGRITA.txt"
+  cp "$B/RsyncGUI-Windows/INTEGRITA.txt" "$B/INTEGRITA-windows-amd64.txt"
   /c/Windows/System32/tar.exe -a -c -f "$(cygpath -w "$PWD/$B/RsyncGUI-Windows.zip")" \
     -C "$(cygpath -w "$PWD/$B")" RsyncGUI-Windows
   echo "→ $B/RsyncGUI-Windows.zip"

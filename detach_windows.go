@@ -5,7 +5,10 @@
 package main
 
 import (
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 
 	"golang.org/x/sys/windows"
 )
@@ -32,4 +35,26 @@ func hideConsole(cmd *exec.Cmd) {
 // interrupt. If it does not respond, the caller falls back to terminating it.
 func signalStop(pid int) error {
 	return windows.GenerateConsoleCtrlEvent(windows.CTRL_BREAK_EVENT, uint32(pid))
+}
+
+// interruptProcess asks a child to stop the way Ctrl+C does. Windows has no
+// os.Interrupt for a child (Process.Signal fails) and a console Ctrl+C does not
+// reach rsync, which lives alone on the hidden console CREATE_NO_WINDOW gave
+// it. rsync is an MSYS program, though, and the kill.exe that sits next to it
+// sends it a real SIGINT from outside (-W: the PID is a Windows one): rsync
+// removes its partial temporary file and exits. If there is no kill.exe or it
+// fails, the error goes back to the caller, which terminates the process after
+// a delay.
+func interruptProcess(p *os.Process) error {
+	bin, err := exec.LookPath("rsync")
+	if err != nil {
+		return err
+	}
+	kill := filepath.Join(filepath.Dir(bin), "kill.exe")
+	if _, err := os.Stat(kill); err != nil {
+		return err
+	}
+	cmd := exec.Command(kill, "-INT", "-W", strconv.Itoa(p.Pid))
+	hideConsole(cmd)
+	return cmd.Run()
 }

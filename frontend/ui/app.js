@@ -1259,4 +1259,20 @@ async function init() {
   render();
 }
 
-window.addEventListener("DOMContentLoaded", init);
+// Integrità del programma (internal/autoverifica): parte dopo il primo disegno
+// e non blocca niente. Se i file sono diversi dall'originale compare anche un avviso.
+async function showIntegrity() {
+  try {
+    const s = await api().VerifyIntegrity();
+    const el = $("integrity");
+    el.textContent = s.titolo;
+    el.title = s.dettaglio || s.titolo;
+    el.dataset.esito = s.esito;
+    el.hidden = false;
+    if (s.esito === "diversi" || s.esito === "firma_non_valida") {
+      showBanner(s.titolo + ". " + (s.dettaglio || ""), true);
+    }
+  } catch (e) { /* nessuna riga: verifica non disponibile */ }
+}
+
+window.addEventListener("DOMContentLoaded", () => { init(); setTimeout(showIntegrity, 600); });

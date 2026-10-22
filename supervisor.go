@@ -331,7 +331,7 @@ func runOneRsync(opts SyncOptions, srcs []string, dest string, logw *jobs.LogWri
 		*aborted = true
 		// SIGINT rather than a hard kill: rsync traps it and removes the
 		// temporary file it was writing.
-		_ = cmd.Process.Signal(os.Interrupt)
+		_ = interruptProcess(cmd.Process)
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):
