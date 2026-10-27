@@ -173,6 +173,9 @@ type App struct {
 	// abort cancels the running queue and kills the rsync process in flight.
 	abort    context.CancelFunc
 	settings Settings
+	// pcloud holds the passwords of this session, by account e-mail. Memory
+	// only: never written to profiles.json, to the job state or to the log.
+	pcloud map[string]string
 	// outcome of the startup self-check (integrity.go)
 	integrity integrityState
 
@@ -834,6 +837,11 @@ type statusEvent struct {
 // supervisor process that outlives this window; the in-window runner below is
 // kept for when the setting is off, and is unchanged from 2.2.
 func (a *App) enqueue(list []SyncProfile) error {
+	// pCloud wants a password nobody has stored: ask for it before anything
+	// starts, with an error the window turns into its login dialog.
+	if who := a.pcloudNeedsLogin(list); who != "" {
+		return errors.New(loginPrefix + who)
+	}
 	if a.detachEnabled() {
 		label := runLabel(list)
 		_, err := a.startDetached(label, list)
@@ -1150,7 +1158,7 @@ func (a *App) runProfile(runCtx context.Context, p SyncProfile) (completed int, 
 			issues = append(issues, msg)
 			a.emitLog("⚠ " + msg + "\n")
 		default:
-			msg := fmt.Sprintf("%s → %s: rsync terminato con errore (exit %d)", p.Name, dest, exitCode)
+			msg := fmt.Sprintf("%s → %s: rsync terminato con errore (exit %d)%s", p.Name, dest, exitCode, pcloudHint(exitCode, srcs, dest))
 			issues = append(issues, msg)
 			a.emitLog("✗ " + msg + "\n")
 		}
@@ -1188,6 +1196,12 @@ func interruptOnCancel(cmd *exec.Cmd) {
 // protectRules is the filter file from writeTwinProtectRules, "" for none.
 func rsyncArgs(opts SyncOptions, sources []string, dest, protectRules string) []string {
 	args := []string{"-a"}
+	// pCloud (rsync over SSH) cannot keep permissions, owners, times, links or
+	// special files: see pcloudCopyArgs. They come right after -a so they win.
+	cloud := anyPCloud(sources, dest)
+	if cloud {
+		args = append(args, pcloudCopyArgs(opts)...)
+	}
 	if opts.Checksum {
 		args = append(args, "-c")
 	}
@@ -1246,7 +1260,7 @@ func rsyncArgs(opts SyncOptions, sources []string, dest, protectRules string) []
 	// The slash rule works on the path as rsync will see it (on Windows
 	// "C:\A\" becomes "/proc/cygdrive/c/A/"), the stat on the local one.
 	for _, local := range sources {
-		src := rsyncPath(local)
+		src := rsyncPath(pcloudNormalize(local))
 		if opts.RecreateStructure {
 			if trimmed := strings.TrimRight(src, "/"); trimmed != "" {
 				src = trimmed
@@ -1256,7 +1270,7 @@ func rsyncArgs(opts SyncOptions, sources []string, dest, protectRules string) []
 		}
 		args = append(args, src)
 	}
-	return append(args, rsyncPath(dest))
+	return append(args, rsyncPath(pcloudNormalize(dest)))
 }
 
 // isPartialTransferExitCode reports rsync exit codes that mean the run
@@ -1290,6 +1304,11 @@ func (a *App) execRsync(runCtx context.Context, opts SyncOptions, sources []stri
 
 	cmd := newRsyncCmd(runCtx, rsyncBin, rsyncArgs(opts, sources, dest, protectRules)...)
 	interruptOnCancel(cmd)
+	env, err := pcloudChildEnv(a.pcloudSecretsFor([]SyncProfile{{Sources: sources, Destinations: []string{dest}}}), sources, dest)
+	if err != nil {
+		return -1, err
+	}
+	cmd.Env = env
 	pr, pw := io.Pipe()
 	cmd.Stdout = pw
 	cmd.Stderr = pw

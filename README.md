@@ -7,7 +7,7 @@ GUI nativa e multipiattaforma per `rsync`, scritta in Go + [Wails](https://wails
 
 ## Download
 
-Le build compilate (macOS Apple Silicon/Intel, Windows, Linux + AppImage) sono nella pagina **[Release](https://github.com/TrismegistoOpenSource/RsyncGUI/releases)** — non serve installare nulla per compilare, si scarica e si usa.
+Le build compilate (macOS Apple Silicon/Intel, Windows, Linux + AppImage) sono nella pagina **[Release](https://github.com/TrismegistoOpenSource/RsyncGUI/releases)** — non serve installare nulla per compilare, si scarica e si usa. Serve però **rsync**: su macOS e Linux c'è già, su Windows va installato (vedi sotto).
 
 ### macOS: sbloccare l'app al primo avvio
 
@@ -34,6 +34,37 @@ alternativa: clic destro sull'app → **Apri** → di nuovo **Apri**.
 > ne avrà una e le build saranno notarizzate, la quarantena non scatterà più e
 > queste istruzioni andranno rimosse.
 
+### Windows: installare rsync (una volta sola)
+
+L'app **non include rsync**, e Windows non ne ha uno: su un PC appena installato
+RsyncGUI si apre, ma non può copiare finché rsync non c'è (all'avvio lo segnala e
+offre i collegamenti). La strada provata è **MSYS2**, che porta con sé anche `ssh`
+(serve per le destinazioni remote e per pCloud):
+
+1. Scarica e installa MSYS2 da [msys2.org](https://www.msys2.org/) (cartella
+   predefinita `C:\msys64`).
+2. Apri **MSYS2 MSYS** dal menu Start e lancia:
+   ```bash
+   pacman -S rsync openssh
+   ```
+3. Aggiungi `C:\msys64\usr\bin` al `Path` di Windows: **Start** → «Modifica le
+   variabili di ambiente per l'account» → `Path` → **Modifica** → **Nuovo** →
+   `C:\msys64\usr\bin`. Mettila **in fondo** alla lista, così gli strumenti di
+   MSYS2 non prendono il posto di quelli di Windows.
+4. **Chiudi e riapri RsyncGUI** (un programma già aperto non vede il `Path`
+   nuovo). Per controllare, in PowerShell: `rsync --version` e `ssh -V`.
+5. Solo per le destinazioni remote e pCloud: se `ssh -V` risponde
+   `OpenSSH_for_Windows…`, vince l'`ssh` di Windows (`C:\Windows\System32\OpenSSH`),
+   che con rsync di MSYS2 non è stato provato. Per usare quello di MSYS2 metti
+   `C:\msys64\usr\bin` **sopra** quella voce, nel `Path` **di sistema** (serve
+   l'amministratore: il `Path` dell'account viene sempre dopo) e riapri l'app (`ssh -V` deve dire
+   `OpenSSH_10…` o simile, senza «for_Windows»).
+
+Alternative: [cwRsync](https://itefix.net/cwrsync), con la sua cartella nel `Path`
+allo stesso modo; oppure WSL. L'`rsync` deve essere GNU rsync (o openrsync) e, per
+pCloud, nella stessa cartella dev'esserci un `ssh` OpenSSH 8.4 o più recente.
+Tutte le prove di RsyncGUI su Windows sono fatte con MSYS2.
+
 ## Funzionalità
 
 - **Aggiungi / Rimuovi** profili di sincronizzazione, ciascuno con **più sorgenti e più destinazioni**: rsync accetta nativamente più sorgenti in un solo comando, ma una sola destinazione per invocazione, quindi l'app esegue un rsync per ogni destinazione, in sequenza.
@@ -49,6 +80,7 @@ alternativa: clic destro sull'app → **Apri** → di nuovo **Apri**.
 - **Pulizia automatica dei log**: il log di una copia riuscita viene cancellato appena finisce, lasciando solo il riepilogo; si conservano quelli delle copie fallite (30 giorni), con un tetto complessivo sulla cartella. Un backup non deve riempire il disco su cui salva.
 - **Notifiche di sistema** al termine di ogni profilo, con l'esito (completato, completato con avvisi, fallito). Un'interruzione volontaria non notifica nulla.
 - **Esclusioni automatiche** dei file che i sistemi operativi creano da soli (`.DS_Store`, `Thumbs.db`, `desktop.ini`, ecc.), attive di default, più esclusioni personalizzate.
+- **Backup su pCloud** (dalla 3.0): pCloud accetta rsync su SSH, porta 22 (`rsync.pcloud.com` per gli USA, `ersync.pcloud.com` per l'Europa; utente l'e-mail dell'account). Nell'editor, **+ pCloud…** chiede server, e-mail e cartella e salva la destinazione come una normale destinazione remota (`email@ersync.pcloud.com:/Backup/`). **La password non è mai nei profili, nell'esportazione, nel log o sulla riga di comando**: alla prima copia la finestra di accesso la verifica e, se lasci la casella «Ricorda», la affida al **portachiavi del sistema** (Keychain su macOS, Gestione credenziali su Windows, Secret Service — GNOME Keyring/KWallet — su Linux). Da allora le copie partono senza riaccedere; «Dimentica password» (nella finestra pCloud) la toglie. Senza portachiavi (una sessione Linux spoglia) la password vale per la sessione e l'app lo dice. Arriva a `ssh` tramite `SSH_ASKPASS` (il programma stesso fa da helper) e funziona anche con le copie a finestra chiusa. Le opzioni sono quelle del manuale di pCloud (niente permessi, proprietario, date, link simbolici, file speciali) più `--size-only`, perché senza date rsync non saprebbe riconoscere i file già copiati; se serve il confronto sicuro si attiva il checksum. Con la verifica in due passaggi pCloud manda l'e-mail «New login attempt» al primo accesso da un dispositivo nuovo: si approva una volta. La cartella Crypto di pCloud non è raggiungibile via rsync. Serve un `ssh` accanto a `rsync` (OpenSSH 7.6+; per `SSH_ASKPASS_REQUIRE`, 8.4+).
 - **Percorsi non disponibili** (volume non montato, mount di rete morto) vengono saltati senza bloccare la coda, segnalati nel log e in un riepilogo a fine esecuzione.
 - **Verifica cartella**: scansiona una cartella e segnala i file che il filesystem elenca ma rifiuta di aprire — utile prima di un backup su NAS/cloud con condivisioni di rete inaffidabili.
 - **Interrompi** una sincronizzazione in corso con l'equivalente di Ctrl+C (SIGINT, non un kill secco: rsync ha modo di ripulire i file temporanei).
@@ -96,7 +128,7 @@ Rileva l'OS e compila. Su macOS produce **due app separate**, ciascuna con archi
 Dipendenze per piattaforma:
 - **macOS**: Xcode Command Line Tools.
 - **Linux**: `build-essential`, `pkg-config`, `libgtk-3-dev`, `libwebkit2gtk-4.1-dev` (su Ubuntu 24.04+ la `4.0-dev` non esiste più) — e compilare con `wails build -tags webkit2_41`, altrimenti pkg-config cerca comunque la 4.0.
-- **Windows**: WebView2 (incluso in Windows 10/11). `rsync` non è nativo su Windows: serve nel `PATH` (MSYS2, cwRsync o WSL) — l'app lo segnala all'avvio se manca.
+- **Windows**: WebView2 (incluso in Windows 10/11). `rsync` non è nativo su Windows: serve nel `PATH` (MSYS2, cwRsync o WSL; istruzioni sopra, «Windows: installare rsync») — l'app lo segnala all'avvio se manca.
 
 La compilazione va fatta sulla piattaforma di destinazione: il cross-compile con UI nativa non è affidabile con Wails. Per questo le release su GitHub sono compilate da [GitHub Actions](.github/workflows/build.yml) su runner macOS, Windows e Linux reali.
 

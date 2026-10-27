@@ -42,11 +42,15 @@ func runSupervisorIfRequested() bool {
 }
 
 // supervise runs one job to completion and records the outcome.
+var supervisorSecrets map[string]string
+
 func supervise(dir, jobID string) error {
 	paths, err := jobs.PathsFor(dir, jobID)
 	if err != nil {
 		return err
 	}
+	// Passwords handed over by the window that started us: kept in memory.
+	supervisorSecrets = takeSecretsCarrier()
 
 	st, err := jobs.ReadState(dir, jobID)
 	if err != nil {
@@ -269,7 +273,7 @@ func runProfiles(dir string, st *jobs.State, logw *jobs.LogWriter, stopped <-cha
 				issues = append(issues, msg)
 				fmt.Fprintf(logw, "⚠ %s\n", msg)
 			default:
-				msg := fmt.Sprintf("%s → %s: rsync terminato con errore (exit %d)", prof.Name, dest, exit)
+				msg := fmt.Sprintf("%s → %s: rsync terminato con errore (exit %d)%s", prof.Name, dest, exit, pcloudHint(exit, srcs, dest))
 				issues = append(issues, msg)
 				fmt.Fprintf(logw, "✗ %s\n", msg)
 			}
@@ -317,6 +321,11 @@ func runOneRsync(opts SyncOptions, srcs []string, dest string, logw *jobs.LogWri
 	defer cleanup()
 
 	cmd := newRsyncCmd(context.Background(), bin, rsyncArgs(opts, srcs, dest, protectRules)...)
+	env, err := pcloudChildEnv(supervisorSecrets, srcs, dest)
+	if err != nil {
+		return -1, err
+	}
+	cmd.Env = env
 	cmd.Stdout = pw
 	cmd.Stderr = pw
 	if err := cmd.Start(); err != nil {

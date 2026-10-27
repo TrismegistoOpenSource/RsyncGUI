@@ -119,6 +119,114 @@ function askConfirm({ title, bodyHtml, confirmLabel, checkboxLabel }) {
   });
 }
 
+
+// ---- pCloud ---------------------------------------------------------------------
+// The password is asked here and sent to the backend, which keeps it in memory
+// for the session. A run that needs it fails first with "pcloud-login:user@host";
+// withLogin turns that into the dialog and tries again.
+
+async function withLogin(fn) {
+  for (;;) {
+    try {
+      return await fn();
+    } catch (e) {
+      const m = /pcloud-login:(\S+)/.exec(String(e));
+      if (!m) throw e;
+      if (!(await askPCloudLogin(m[1]))) return;
+    }
+  }
+}
+
+function askPCloudLogin(userHost) {
+  return new Promise((resolve) => {
+    const overlay = $("pclogin-modal");
+    const pw = $("pl-password");
+    const err = $("pl-error");
+    const ok = $("pl-ok");
+    $("pl-who").textContent = userHost;
+    pw.value = "";
+    err.hidden = true;
+    ok.disabled = false;
+    ok.textContent = "Accedi";
+
+    const done = (result) => {
+      overlay.hidden = true;
+      pw.value = "";
+      ok.removeEventListener("click", onOk);
+      $("pl-cancel").removeEventListener("click", onCancel);
+      pw.removeEventListener("keydown", onEnter);
+      resolve(result);
+    };
+    const onOk = async () => {
+      if (!pw.value) return;
+      ok.disabled = true;
+      ok.textContent = "Verifica in corso…";
+      err.hidden = true;
+      try {
+        const warn = await api().PCloudLogin(userHost, pw.value, $("pl-remember").checked);
+        if (warn) showBanner(warn, true);
+        done(true);
+      } catch (e) {
+        err.textContent = String(e).replace(/^Error:\s*/, "");
+        err.hidden = false;
+        ok.disabled = false;
+        ok.textContent = "Accedi";
+      }
+    };
+    const onCancel = () => done(false);
+    const onEnter = (e) => { if (e.key === "Enter") onOk(); if (e.key === "Escape") onCancel(); };
+
+    ok.addEventListener("click", onOk);
+    $("pl-cancel").addEventListener("click", onCancel);
+    pw.addEventListener("keydown", onEnter);
+    overlay.hidden = false;
+    pw.focus();
+  });
+}
+
+// Resolves with the stored destination string, or null if cancelled.
+function askPCloudFolder() {
+  return new Promise((resolve) => {
+    const overlay = $("pcloud-modal");
+    const email = $("pc-email");
+    const folder = $("pc-folder");
+    const err = $("pc-error");
+    err.hidden = true;
+
+    const done = (result) => {
+      overlay.hidden = true;
+      $("pc-ok").removeEventListener("click", onOk);
+      $("pc-cancel").removeEventListener("click", onCancel);
+      $("pc-forget").removeEventListener("click", onForget);
+      resolve(result);
+    };
+    const onOk = async () => {
+      try {
+        done(await api().PCloudSpec($("pc-region").value, email.value, folder.value));
+      } catch (e) {
+        err.textContent = String(e).replace(/^Error:\s*/, "");
+        err.hidden = false;
+      }
+    };
+    const onCancel = () => done(null);
+    const onForget = async () => {
+      try {
+        await api().PCloudForget(email.value);
+        err.textContent = "Password dimenticata: verrà chiesta alla prossima copia.";
+      } catch (e) {
+        err.textContent = String(e).replace(/^Error:\s*/, "");
+      }
+      err.hidden = false;
+    };
+
+    $("pc-ok").addEventListener("click", onOk);
+    $("pc-cancel").addEventListener("click", onCancel);
+    $("pc-forget").addEventListener("click", onForget);
+    overlay.hidden = false;
+    email.focus();
+  });
+}
+
 // ---- rendering --------------------------------------------------------------
 
 function isBusy() { return state.windowBusy || state.jobsBusy; }
@@ -162,7 +270,7 @@ function renderChips() {
       tag, count,
       `Avvia in sequenza tutte le destinazioni con tag "${tag}"`,
       "",
-      () => api().RunTag(tag)
+      () => withLogin(() => api().RunTag(tag))
     ));
   }
   const untagged = state.profiles.filter((p) => !p.tag).length;
@@ -171,7 +279,7 @@ function renderChips() {
       "Senza tag", untagged,
       "Avvia in sequenza tutte le destinazioni senza tag",
       "chip-untagged",
-      () => api().RunUntagged()
+      () => withLogin(() => api().RunUntagged())
     ));
   }
 }
@@ -278,7 +386,7 @@ function profileCard(p, draggable) {
   btnRun.disabled = isBusy();
   btnRun.addEventListener("click", async (e) => {
     e.stopPropagation();
-    try { await api().RunOne(p.id); refreshJobs(); } catch (err) { showBanner(String(err), true); }
+    try { await withLogin(() => api().RunOne(p.id)); refreshJobs(); } catch (err) { showBanner(String(err), true); }
   });
 
   actions.append(btnEdit);
@@ -391,7 +499,7 @@ async function onRestore(p) {
   }
 
   try {
-    await api().RunRestore(p.id, answer.checked);
+    await withLogin(() => api().RunRestore(p.id, answer.checked));
     refreshJobs();
   } catch (e) {
     showBanner(String(e), true);
@@ -1191,6 +1299,11 @@ function wire() {
   $("btn-add-dest").addEventListener("click", (e) => {
     e.preventDefault();
     pathRow($("dest-list"), "", "Scegli la cartella di destinazione");
+  });
+  $("btn-add-pcloud").addEventListener("click", async (e) => {
+    e.preventDefault();
+    const spec = await askPCloudFolder();
+    if (spec) pathRow($("dest-list"), spec, "Scegli la cartella di destinazione");
   });
 
   $("btn-log").addEventListener("click", toggleLog);

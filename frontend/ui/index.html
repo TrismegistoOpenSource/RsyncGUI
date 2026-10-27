@@ -27,7 +27,7 @@
         </g>
       </svg>
       <span class="brand-name">RsyncGUI</span>
-      <span class="brand-version">2.6.0</span>
+      <span class="brand-version">3.0.0</span>
     </div>
     <div class="titlebar-actions" style="--wails-draggable:no-drag">
       <button class="btn ghost" id="btn-verify" title="Controlla una cartella: trova i file che il sistema elenca ma non riesce davvero ad aprire (letto soltanto, non copia né modifica nulla)">
@@ -133,6 +133,7 @@
         <span class="field-label">Destinazioni <em>(una copia per ciascuna, in sequenza)</em></span>
         <div id="dest-list" class="path-list"></div>
         <button class="btn ghost small add-path" id="btn-add-dest">+ Aggiungi destinazione</button>
+        <button class="btn ghost small add-path" id="btn-add-pcloud" title="Copia su pCloud con rsync su SSH (porta 22). La password non viene salvata: la chiede una volta per sessione.">+ pCloud…</button>
 
         <label class="recreate-row" id="recreate-row">
           <input type="checkbox" id="f-recreate" />
@@ -252,6 +253,60 @@
       <div class="modal-actions">
         <button class="btn ghost" id="confirm-cancel">Annulla</button>
         <button class="btn danger" id="confirm-ok"></button>
+      </div>
+    </div>
+  </div>
+
+  <!-- pCloud: the stored destination is just "email@host:/folder"; the
+       password is never saved (it is asked at the first copy of each session). -->
+  <div class="modal-overlay" id="pcloud-modal" hidden>
+    <div class="modal confirm-modal">
+      <h2>Cartella su pCloud</h2>
+      <label class="field">
+        <span>Server</span>
+        <select id="pc-region">
+          <option value="eu">Europa — ersync.pcloud.com</option>
+          <option value="us">USA — rsync.pcloud.com</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>E-mail dell'account pCloud</span>
+        <input type="email" id="pc-email" autocomplete="off" placeholder="nome@esempio.it" />
+      </label>
+      <label class="field">
+        <span>Cartella su pCloud</span>
+        <input type="text" id="pc-folder" autocomplete="off" placeholder="/Backup/Documenti" />
+      </label>
+      <p class="rsync-note">La password non è mai nei profili né nell'esportazione: verrà chiesta alla prima copia
+      e, se vuoi, ricordata nel portachiavi del sistema. La cartella Crypto di pCloud non è raggiungibile.</p>
+      <p class="rsync-note pc-error" id="pc-error" hidden></p>
+      <div class="modal-actions">
+        <button class="btn ghost" id="pc-forget" title="Toglie dal portachiavi la password salvata di questa e-mail: alla prossima copia verrà richiesta di nuovo">Dimentica password</button>
+        <button class="btn ghost" id="pc-cancel">Annulla</button>
+        <button class="btn primary" id="pc-ok">Aggiungi</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="pclogin-modal" hidden>
+    <div class="modal confirm-modal">
+      <h2>Accedi a pCloud</h2>
+      <p class="rsync-note" id="pl-who"></p>
+      <label class="field">
+        <span>Password</span>
+        <input type="password" id="pl-password" autocomplete="off" />
+      </label>
+      <label class="switch-row">
+        <span>Ricorda la password <em class="sysex-hint">nel portachiavi del sistema</em></span>
+        <input type="checkbox" id="pl-remember" checked /><i></i>
+      </label>
+      <p class="rsync-note">Se la ricordi, la custodisce il sistema (Keychain, Gestione credenziali, portachiavi di Linux):
+      non finisce mai nei profili né nell'esportazione. Con la verifica in due passaggi, la prima volta
+      approva l'e-mail «New login attempt» di pCloud.</p>
+      <p class="rsync-note pc-error" id="pl-error" hidden></p>
+      <div class="modal-actions">
+        <button class="btn ghost" id="pl-cancel">Annulla</button>
+        <button class="btn primary" id="pl-ok">Accedi</button>
       </div>
     </div>
   </div>

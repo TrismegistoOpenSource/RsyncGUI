@@ -169,7 +169,11 @@ func (a *App) startDetached(label string, list []SyncProfile) (string, error) {
 	// Deliberately not exec.CommandContext: its cancellation would kill the
 	// child when this window's context ends, which is exactly what we are
 	// trying to avoid.
-	if err := launchDetached(exec.Command(self, superviseFlag, store.Dir, st.JobID)); err != nil {
+	sup := exec.Command(self, superviseFlag, store.Dir, st.JobID)
+	if err := withSecretsCarrier(sup, a.pcloudSecretsFor(list)); err != nil {
+		return "", err
+	}
+	if err := launchDetached(sup); err != nil {
 		return "", err
 	}
 

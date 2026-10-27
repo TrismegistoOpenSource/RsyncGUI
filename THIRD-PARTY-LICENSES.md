@@ -19,6 +19,8 @@ Windows e in `usr/share/doc/rsyncgui/` nell'AppImage per Linux.
 | [Wails v2](https://wails.io) | MIT | © Lea Anthony |
 | [google/uuid](https://github.com/google/uuid) | BSD-3-Clause | © 2009, 2014 Google Inc. |
 | [gen2brain/beeep](https://github.com/gen2brain/beeep) | BSD-2-Clause | © 2017 Milan Nikolic |
+| [zalando/go-keyring](https://github.com/zalando/go-keyring) | MIT | © 2018 Zalando SE (portachiavi del sistema, per la password di pCloud) |
+| [danieljoos/wincred](https://github.com/danieljoos/wincred) | MIT | © Daniel Joos (portato da go-keyring, solo Windows) |
 | Go standard library e runtime | BSD-3-Clause | © The Go Authors |
 
 ## Dipendenze indirette (portate da Wails)

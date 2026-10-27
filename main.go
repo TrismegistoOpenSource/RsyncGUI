@@ -18,6 +18,9 @@ var assets embed.FS
 func main() {
 	// Started with --supervise, this process is a detached job runner, not a
 	// window: it must never reach wails.Run.
+	if runAskpassIfRequested() {
+		return
+	}
 	if runSupervisorIfRequested() {
 		return
 	}
@@ -44,7 +47,7 @@ func main() {
 		Mac: &mac.Options{
 			TitleBar: mac.TitleBarHiddenInset(),
 			About: &mac.AboutInfo{
-				Title:   "RsyncGUI 2.6.0",
+				Title:   "RsyncGUI 3.0.0",
 				Message: "GUI leggera e multipiattaforma per rsync",
 			},
 		},

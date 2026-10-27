@@ -354,3 +354,69 @@ delete"). `--delete-excluded` è stato scartato: cancellerebbe anche
 SD scrivono lì) e le esclusioni personalizzate, e in openrsync annulla le regole
 `-r` qui sopra (verificato). `._*` resta escluso: su FAT/exFAT e SMB contiene
 gli attributi estesi dei file della destinazione stessa.
+
+---
+
+## 12. Backup su pCloud: rsync su SSH, password solo in memoria (3.0.0)
+
+**Deciso**: una destinazione pCloud è una normale destinazione remota
+(`email@ersync.pcloud.com:/Cartella/`; host `rsync.pcloud.com` per gli USA,
+porta 22, utente l'e-mail dell'account), riconosciuta dal nome dell'host
+(`pcloud.go`). Nel profilo c'è solo quella stringa: nessun campo nuovo, nessuna
+password, quindi `profiles.json` e l'esportazione restano senza segreti e le
+versioni vecchie leggono ancora il file. La password si chiede alla prima copia
+di ogni sessione (`PCloudLogin`, che la verifica con un `rsync --list-only`),
+resta in memoria nell'`App` e arriva a `ssh` per `SSH_ASKPASS`, con il binario
+stesso come helper (`RSYNCGUI_ASKPASS_PW` esiste solo nell'ambiente dei figli di
+rsync). Alle copie a finestra chiusa la finestra la passa al supervisore
+nell'ambiente del processo (`RSYNCGUI_PCLOUD_SECRETS`, tolta subito dopo la
+lettura): niente file, niente pipe.
+
+**Opzioni**: quelle del manuale di pCloud (`--no-times --no-links --no-specials
+--no-devices`) più `--no-perms --no-owner --no-group`, che pCloud normalizza, e
+`--size-only`: senza date rsync troverebbe diverso ogni file a ogni giro.
+Il compromesso (un file modificato senza cambiare dimensione non viene
+rimandato) si evita attivando il checksum, che esclude `--size-only`.
+`-e ssh` porta `StrictHostKeyChecking=accept-new` (nessuna domanda sì/no a cui
+nessuno può rispondere, ma chiave cambiata = rifiuto) e keep-alive per le copie
+lunghe.
+
+**Scartato**: rclone/WebDAV (pCloud documenta rsync su SSH); la password nel
+portachiavi (richiesto dall'utente: nessuna credenziale salvata, basta
+riloggare); `sshpass` (un programma in più su tre sistemi); la password sulla
+riga di comando o in un file temporaneo (visibili ad altri processi / lasciati
+su disco).
+
+**Da provare con un account vero** (non c'era in sviluppo; i test usano un finto
+`ssh`): login, 2FA, un giro completo e uno incrementale con `--size-only`,
+`--delete`, ripristino da pCloud. Windows: `ssh` accanto a `rsync` (MSYS2/cwRsync)
+e `SSH_ASKPASS` con un eseguibile Windows. macOS: openrsync e `--no-*`.
+
+---
+
+## 13. La password di pCloud sta nel portachiavi del sistema (3.0.0, sostituisce in parte la 12)
+
+**Deciso** (utente, 24/10/2026): la password va ricordata — riaccedere a ogni
+sessione e rifare la verifica in due passaggi non è accettabile — ma in modo
+sicuro e fuori dal JSON. Si usa il portachiavi del sistema tramite
+`zalando/go-keyring` (MIT, senza cgo): Keychain su macOS, Credential Manager su
+Windows, Secret Service su Linux. Voce «RsyncGUI pCloud», account = e-mail.
+Si scrive solo dopo un accesso riuscito e con la casella «Ricorda» (attiva di
+default); «Dimentica password» la toglie. Resta valido tutto il resto della 12:
+nessun segreto nel profilo, nell'esportazione, nel log, sulla riga di comando o
+in un file; passaggio a ssh con `SSH_ASKPASS`; al supervisore la password
+arriva nell'ambiente del processo, ora letta dal portachiavi invece che chiesta.
+
+**Senza portachiavi** (Linux senza Secret Service in esecuzione) il salvataggio
+fallisce: l'accesso vale lo stesso, la password resta in memoria per la sessione e
+l'utente è avvisato che la prossima volta la ridovrà inserire. Nessun ripiego su
+file: un segreto in chiaro sul disco è peggio di una domanda in più.
+
+**Sulla verifica in due passaggi**: ricordare la password non la toglie. pCloud
+chiede l'approvazione dell'e-mail «New login attempt» quando vede un dispositivo
+o un luogo nuovo, non a ogni accesso: da verificare con un account vero quanto
+spesso torni con rsync.
+
+**Scartato**: password cifrata in un file dell'app (la chiave starebbe accanto al
+file: finta sicurezza); chiave SSH al posto della password (pCloud documenta solo
+la password).
