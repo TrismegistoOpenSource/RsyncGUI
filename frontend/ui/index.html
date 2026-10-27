@@ -27,7 +27,7 @@
         </g>
       </svg>
       <span class="brand-name">RsyncGUI</span>
-      <span class="brand-version">3.0.0</span>
+      <span class="brand-version">3.0.1</span>
     </div>
     <div class="titlebar-actions" style="--wails-draggable:no-drag">
       <button class="btn ghost" id="btn-verify" title="Controlla una cartella: trova i file che il sistema elenca ma non riesce davvero ad aprire (letto soltanto, non copia né modifica nulla)">
@@ -133,7 +133,7 @@
         <span class="field-label">Destinazioni <em>(una copia per ciascuna, in sequenza)</em></span>
         <div id="dest-list" class="path-list"></div>
         <button class="btn ghost small add-path" id="btn-add-dest">+ Aggiungi destinazione</button>
-        <button class="btn ghost small add-path" id="btn-add-pcloud" title="Copia su pCloud con rsync su SSH (porta 22). La password non viene salvata: la chiede una volta per sessione.">+ pCloud…</button>
+        <button class="btn ghost small add-path" id="btn-add-pcloud" title="Copia su pCloud con rsync su SSH (porta 22). La password non va mai nei profili: la chiede alla prima copia e, se vuoi, la ricorda il portachiavi del sistema.">+ pCloud…</button>
 
         <label class="recreate-row" id="recreate-row">
           <input type="checkbox" id="f-recreate" />
@@ -258,7 +258,8 @@
   </div>
 
   <!-- pCloud: the stored destination is just "email@host:/folder"; the
-       password is never saved (it is asked at the first copy of each session). -->
+       password is never in the profiles (it is asked at the first copy and
+       kept in memory, or in the system keychain if "Ricorda" is ticked). -->
   <div class="modal-overlay" id="pcloud-modal" hidden>
     <div class="modal confirm-modal">
       <h2>Cartella su pCloud</h2>

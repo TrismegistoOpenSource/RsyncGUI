@@ -50,6 +50,10 @@ func TestPCloudSpecAndNormalize(t *testing.T) {
 	if got := pcloudNormalize(`"mario@example.com"@rsync.pcloud.com:/x`); got != "mario@example.com@rsync.pcloud.com:/x" {
 		t.Errorf("virgolette non tolte: %q", got)
 	}
+	// scritto a mano con le maiuscole: fino alla 3.0.0 mandava in crash l'app
+	if got := pcloudNormalize("mario@example.com@Rsync.PCloud.com:/Backup/Foto"); got != "mario@example.com@rsync.pcloud.com:/Backup/Foto" {
+		t.Errorf("server in maiuscolo: %q", got)
+	}
 	if got := pcloudNormalize("/tmp/x"); got != "/tmp/x" {
 		t.Errorf("un percorso locale non va toccato: %q", got)
 	}

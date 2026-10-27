@@ -11,7 +11,7 @@ import (
 )
 
 // appVersion must match productVersion in wails.json (TestVersionMatchesWails).
-const appVersion = "3.0.0"
+const appVersion = "3.0.1"
 
 // releaseRepo is where the signed release lives; the startup self-check
 // downloads its signature from there (see internal/autoverifica).

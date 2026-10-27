@@ -101,12 +101,13 @@ func pcloudSpec(region, email, folder string) string {
 
 // pcloudNormalize drops the shell quotes around the user part: rsync is not
 // run through a shell and would send them to the server as part of the name.
+// The host comes back in lower case (pcloudAccount accepts it in any case).
 func pcloudNormalize(spec string) string {
 	email, host, ok := pcloudAccount(spec)
 	if !ok {
 		return spec
 	}
-	return email + "@" + spec[strings.Index(spec, host):]
+	return email + "@" + host + spec[strings.Index(spec, ":"):]
 }
 
 // anyPCloud reports whether a copy touches pCloud at either end.
